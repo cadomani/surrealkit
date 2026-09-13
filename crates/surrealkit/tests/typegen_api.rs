@@ -160,12 +160,12 @@ async fn render_typescript_emits_sdk_interfaces() {
 
 	// PascalCase interface + synthesized typed id.
 	assert!(ts.contains("export interface User {"), "got:\n{ts}");
-	assert!(ts.contains("id: RecordId<'user'>;"), "got:\n{ts}");
+	assert!(ts.contains("id: RecordId<'user', string>;"), "got:\n{ts}");
 	// Field mappings from the introspected schema.
 	assert!(ts.contains("name: string;"), "got:\n{ts}");
 	assert!(ts.contains("nickname?: string;"), "got:\n{ts}");
 	assert!(ts.contains("tags: string[];"), "got:\n{ts}");
-	assert!(ts.contains("best_friend: RecordId<'user'>;"), "got:\n{ts}");
+	assert!(ts.contains("best_friend: RecordId<'user', string>;"), "got:\n{ts}");
 	// Dotted sub-field becomes a nested object property.
 	assert!(ts.contains("address: {"), "got:\n{ts}");
 	assert!(ts.contains("city: string;"), "got:\n{ts}");
@@ -201,7 +201,7 @@ async fn run_typegen_writes_typescript_file_when_configured() {
 	assert!(json_out.exists(), "json should still be written");
 	let ts = std::fs::read_to_string(ts_dir.join("index.ts")).expect("read index.ts");
 	assert!(ts.contains("export interface User {"), "got:\n{ts}");
-	assert!(ts.contains("id: RecordId<'user'>;"), "got:\n{ts}");
+	assert!(ts.contains("id: RecordId<'user', string>;"), "got:\n{ts}");
 }
 
 #[test]

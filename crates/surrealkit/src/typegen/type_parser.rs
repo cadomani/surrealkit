@@ -181,7 +181,7 @@ impl Parser {
 			Some(c) if c == '\'' || c == '"' => self.parse_string_literal(c),
 			Some(c) if c.is_ascii_digit() || c == '-' || c == '+' => self.parse_number_literal(),
 			Some(c) if c.is_ascii_alphabetic() => self.parse_ident_type(),
-			Some(c) if c == '{' => self.parse_object_type(),
+			Some('{') => self.parse_object_type(),
 			Some(_) => {
 				let source = self.remaining_trimmed();
 				self.pos = self.chars.len();

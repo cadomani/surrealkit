@@ -83,13 +83,10 @@ fn render_table(
 	out.push_str(&format!("export interface {} {{\n", pascal_case(&table.name)));
 	// Every record has a typed id. The synthesized field wins over any
 	// introspected `id` field (every record id is a RecordId).
-	let record_type = record_types.get(&table.name);
-	if record_type.is_none() {
-		out.push_str(&format!("  id: RecordId<'{}'>;\n", table.name));
-	} else {
-		out.push_str(&format!("  id: RecordId<'{}', {}>;\n", table.name, record_type.unwrap()));
+	match record_types.get(&table.name) {
+		Some(t) => out.push_str(&format!("  id: RecordId<'{}', {}>;\n", table.name, t)),
+		None => out.push_str(&format!("  id: RecordId<'{}', string>;\n", table.name)),
 	}
-
 	let tree = build_field_tree(&table.fields);
 	for (name, node) in &tree.children {
 		render_node(name, node, 1, out, imports, record_types);
@@ -256,14 +253,9 @@ fn field_type_to_ts(
 			} else {
 				tables
 					.iter()
-					.map(|t| {
-						let record_type = record_types.get(t);
-						if record_type.is_none() {
-							format!("RecordId<'{t}'>")
-						} else {
-							let unwrapped = record_type.unwrap();
-							format!("RecordId<'{t}', {unwrapped}>")
-						}
+					.map(|t| match record_types.get(t) {
+						Some(ty) => format!("RecordId<'{t}', {ty}>"),
+						None => format!("RecordId<'{t}'>"),
 					})
 					.collect::<Vec<_>>()
 					.join(" | ")
@@ -514,7 +506,7 @@ mod tests {
 		let d = doc(vec![table("user", vec![field("name", prim(PrimitiveType::String), false)])]);
 		let ts = to_typescript(&d).unwrap();
 		assert!(ts.contains("export interface User {"), "got:\n{ts}");
-		assert!(ts.contains("id: RecordId<'user'>;"), "got:\n{ts}");
+		assert!(ts.contains("id: RecordId<'user', string>;"), "got:\n{ts}");
 		assert!(ts.contains("name: string;"), "got:\n{ts}");
 		assert!(ts.contains("import type { RecordId } from 'surrealdb';"), "got:\n{ts}");
 	}
