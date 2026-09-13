@@ -211,8 +211,8 @@ impl Parser {
 					depth -= 1;
 				}
 				':' => {
-					let (ty, is_opt) = unwrap_optional(self.parse_union());
 					let name = String::from_iter(&key_name);
+					let (ty, is_opt) = unwrap_optional(self.parse_union());
 					let real_type = if is_opt {
 						FieldType::Option {
 							inner: Box::new(ty),

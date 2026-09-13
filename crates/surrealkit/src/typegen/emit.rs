@@ -69,6 +69,8 @@ fn extract_record_id_type(
 			return;
 		}
 	}
+	// Base case, assume it's a string
+	record_types.insert(table.name.clone(), "string".to_string());
 }
 
 fn render_table(
