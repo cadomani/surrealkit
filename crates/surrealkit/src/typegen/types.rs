@@ -5,7 +5,11 @@
 //! tagged on `kind`) so the JSON can be consumed by other emitters — e.g. a
 //! future TypeScript generator — without re-introspecting the database.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::typegen::string_union::StringUnionMap;
 
 /// Top-level generated schema document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -182,4 +186,36 @@ pub enum PrimitiveType {
 	Object,
 	/// Bare `function`.
 	Function,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectFlags {
+	pub collect_defaults: bool,
+	pub collect_unions: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct EmitCollection {
+	pub flags: CollectFlags,
+	pub defaults: Option<StringUnionMap>,
+	pub record_types: HashMap<String, String>,
+}
+
+impl EmitCollection {
+	pub fn new(flags: CollectFlags) -> Self {
+		Self {
+			flags,
+			defaults: None,
+			record_types: HashMap::new(),
+		}
+	}
+
+	pub fn add_default(&mut self, table: &str, field_name: &str) {
+		let defaults = self.defaults.get_or_insert_with(|| StringUnionMap::new(true));
+		defaults.add_to_union(table, field_name, None);
+	}
+
+	pub fn add_record_type(&mut self, table: String, type_str: String) {
+		self.record_types.insert(table, type_str);
+	}
 }

@@ -461,7 +461,6 @@ fn load_env() -> Option<DotEnv> {
 // but it lets this function use bail!/context directly.
 async fn main() -> Result<()> {
 	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
 	let args = Cli::parse();
 	init_logging(args.verbose);
 	let env = load_env();
@@ -588,8 +587,9 @@ async fn main() -> Result<()> {
 						module: module.clone(),
 						typegen_ts_out: typegen_cfg.typescript.clone(),
 						typegen_ts_format: typegen_cfg.format.clone(),
+						typegen_emit: typegen_cfg.emit.clone(),
 					};
-					let outcome =
+					let outcome: std::prelude::v1::Result<(), anyhow::Error> =
 						sync::run_sync_with_filesystem_sources(&db, opts, layout, files).await;
 					let failed = outcome.is_err();
 					if let Err(err) = &outcome {
@@ -786,6 +786,7 @@ async fn main() -> Result<()> {
 					pretty: !compact,
 					ts_out: typegen_cfg.typescript,
 					ts_format: typegen_cfg.format,
+					ts_emit: typegen_cfg.emit,
 				},
 			)
 			.await?;

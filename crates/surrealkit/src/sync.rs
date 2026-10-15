@@ -21,7 +21,7 @@ use crate::schema_state::{
 	ensure_local_state_dirs_for, ensure_overwrite, render_remove_sql,
 };
 use crate::setup::{run_setup, run_setup_embedded};
-use crate::variables::TemplateVars;
+use crate::variables::{EmitType, TemplateVars};
 
 #[derive(Debug, Clone, Default)]
 #[doc(hidden)]
@@ -53,6 +53,9 @@ pub struct SyncOpts {
 	/// Optional formatter command (`[typegen] format`) run on the regenerated
 	/// `index.ts`.
 	pub typegen_ts_format: Option<String>,
+	/// Optional flag to emit a union of table names, and a mapping of table names to their types.
+	/// Configured via `[typegen] emit` in `surrealkit.toml`.
+	pub typegen_emit: Option<Vec<EmitType>>,
 }
 
 /// A schema file embedded into the binary at compile time (via [`embed_schema!`](crate::embed_schema))
@@ -273,6 +276,7 @@ impl<'a> Sync<'a> {
 			folder: String::new(),
 			typegen_ts_out: None,
 			typegen_ts_format: None,
+			typegen_emit: None,
 		};
 		sync_embedded(db, self.files, &opts).await
 	}
@@ -514,6 +518,7 @@ async fn run_sync_with_files(
 					&doc,
 					ts_dir,
 					opts.typegen_ts_format.as_deref(),
+					opts.typegen_emit.clone().unwrap_or_default(),
 				) {
 					Ok(path) => log::info!("typegen: wrote {}", path.display()),
 					Err(err) => log::error!("typegen: failed to write types: {err:#}"),

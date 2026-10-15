@@ -8,6 +8,7 @@
 mod emit;
 mod introspect;
 mod signature;
+mod string_union;
 mod type_parser;
 mod types;
 
@@ -22,6 +23,8 @@ pub use types::{
 	FieldDef, FieldType, FnArg, FunctionDef, NamedDef, ObjectField, ParamDef, PrimitiveType,
 	SchemaTypes, TableDef,
 };
+
+use crate::variables::EmitType;
 
 /// Options for the `typegen` command.
 #[derive(Debug, Clone, Default)]
@@ -38,18 +41,24 @@ pub struct TypegenOpts {
 	/// Optional formatter command run on the generated `index.ts` after writing.
 	/// Configured via `[typegen] format` in `surrealkit.toml`.
 	pub ts_format: Option<String>,
+	/// Optional vector of flags for emitting during ts generation
+	pub ts_emit: Option<Vec<EmitType>>,
 }
 
 /// Render a [`SchemaTypes`] document as TypeScript. Re-exported so callers
 /// (e.g. the sync/watch loop) can emit types without re-introspecting.
-pub fn render_typescript(doc: &SchemaTypes) -> Result<String> {
-	emit::to_typescript(doc)
+pub fn render_typescript(doc: &SchemaTypes, emit_flags: &[EmitType]) -> Result<String> {
+	emit::to_typescript(doc, emit_flags)
 }
 
 /// Write the TypeScript types for `doc` into `dir/index.ts`, creating `dir` if
 /// needed. Returns the path written.
-pub fn write_typescript(doc: &SchemaTypes, dir: &std::path::Path) -> Result<PathBuf> {
-	let ts = emit::to_typescript(doc)?;
+pub fn write_typescript(
+	doc: &SchemaTypes,
+	dir: &std::path::Path,
+	emit_flags: &[EmitType],
+) -> Result<PathBuf> {
+	let ts = emit::to_typescript(doc, emit_flags)?;
 	std::fs::create_dir_all(dir)?;
 	let path = dir.join("index.ts");
 	std::fs::write(&path, ts)?;
@@ -63,8 +72,9 @@ pub fn write_typescript_formatted(
 	doc: &SchemaTypes,
 	dir: &std::path::Path,
 	format: Option<&str>,
+	emits: Vec<EmitType>,
 ) -> Result<PathBuf> {
-	let path = write_typescript(doc, dir)?;
+	let path = write_typescript(doc, dir, &emits)?;
 	if let Some(cmd) = format {
 		format_file(cmd, &path);
 	}
@@ -139,7 +149,12 @@ pub async fn run_typegen(
 	log::info!("typegen: wrote {}", path.display());
 
 	if let Some(ts_dir) = &opts.ts_out {
-		let ts_path = write_typescript_formatted(&doc, ts_dir, opts.ts_format.as_deref())?;
+		let ts_path = write_typescript_formatted(
+			&doc,
+			ts_dir,
+			opts.ts_format.as_deref(),
+			opts.ts_emit.clone().unwrap_or_default(),
+		)?;
 		log::info!("typegen: wrote {}", ts_path.display());
 	}
 	Ok(())

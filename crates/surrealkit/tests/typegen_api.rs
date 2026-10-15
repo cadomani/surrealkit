@@ -136,6 +136,7 @@ async fn run_typegen_writes_valid_json_file() {
 			pretty: true,
 			ts_out: None,
 			ts_format: None,
+			ts_emit: None,
 		},
 	)
 	.await
@@ -156,7 +157,7 @@ async fn render_typescript_emits_sdk_interfaces() {
 	define_schema(&db).await;
 
 	let doc = generate(&db).await.expect("generate");
-	let ts = render_typescript(&doc).expect("render ts");
+	let ts = render_typescript(&doc, &Vec::new()).expect("render ts");
 
 	// PascalCase interface + synthesized typed id.
 	assert!(ts.contains("export interface User {"), "got:\n{ts}");
@@ -193,6 +194,7 @@ async fn run_typegen_writes_typescript_file_when_configured() {
 			pretty: true,
 			ts_out: Some(ts_dir.clone()),
 			ts_format: None,
+			ts_emit: None,
 		},
 	)
 	.await

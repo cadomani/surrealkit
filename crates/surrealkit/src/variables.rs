@@ -139,6 +139,15 @@ struct ProjectConfig {
 	typegen: TypegenConfig,
 }
 
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum EmitType {
+	Consts,
+	TableNames,
+	TableMap,
+	TableDefaults,
+}
+
 /// The `[typegen]` section of `surrealkit.toml`.
 #[derive(Debug, Default, Clone, Deserialize)]
 pub struct TypegenConfig {
@@ -150,6 +159,7 @@ pub struct TypegenConfig {
 	/// The generated file path is appended as the final argument. Failures are
 	/// non-fatal warnings.
 	pub format: Option<String>,
+	pub emit: Option<Vec<EmitType>>,
 }
 
 /// Load the `[typegen]` section from `surrealkit.toml`. `toml_path` defaults to
