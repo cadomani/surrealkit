@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -139,13 +139,29 @@ struct ProjectConfig {
 	typegen: TypegenConfig,
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
 pub enum EmitType {
 	Consts,
 	TableNames,
 	TableMap,
 	TableDefaults,
+	StringUnions,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+pub struct EmitOverrides {
+	pub table_names: Option<String>,
+	pub table_defaults: Option<String>,
+	pub table_map: Option<String>,
+	pub field_sep: Option<String>,
+	pub types: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub struct TypegenTsConfig {
+	pub emit: Option<HashSet<EmitType>>,
+	pub overrides: Option<EmitOverrides>,
 }
 
 /// The `[typegen]` section of `surrealkit.toml`.
@@ -159,7 +175,7 @@ pub struct TypegenConfig {
 	/// The generated file path is appended as the final argument. Failures are
 	/// non-fatal warnings.
 	pub format: Option<String>,
-	pub emit: Option<Vec<EmitType>>,
+	pub ts_opts: Option<TypegenTsConfig>,
 }
 
 /// Load the `[typegen]` section from `surrealkit.toml`. `toml_path` defaults to

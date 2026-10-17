@@ -587,7 +587,7 @@ async fn main() -> Result<()> {
 						module: module.clone(),
 						typegen_ts_out: typegen_cfg.typescript.clone(),
 						typegen_ts_format: typegen_cfg.format.clone(),
-						typegen_emit: typegen_cfg.emit.clone(),
+						typegen_ts_opts: typegen_cfg.ts_opts.clone(),
 					};
 					let outcome: std::prelude::v1::Result<(), anyhow::Error> =
 						sync::run_sync_with_filesystem_sources(&db, opts, layout, files).await;
@@ -786,7 +786,7 @@ async fn main() -> Result<()> {
 					pretty: !compact,
 					ts_out: typegen_cfg.typescript,
 					ts_format: typegen_cfg.format,
-					ts_emit: typegen_cfg.emit,
+					ts_opts: typegen_cfg.ts_opts,
 				},
 			)
 			.await?;

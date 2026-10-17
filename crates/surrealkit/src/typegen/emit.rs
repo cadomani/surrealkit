@@ -16,7 +16,7 @@ use crate::{
 		type_parser::unwrap_optional,
 		types::{CollectFlags, EmitCollection},
 	},
-	variables::EmitType,
+	variables::{EmitType, TypegenTsConfig},
 };
 
 use super::types::{FieldDef, FieldType, ObjectField, PrimitiveType, SchemaTypes, TableDef};
@@ -31,20 +31,27 @@ pub fn to_json(doc: &SchemaTypes, pretty: bool) -> Result<String> {
 
 /// Render a [`SchemaTypes`] document as TypeScript interfaces targeting the
 /// surrealdb JS SDK (v2). Returns the full file contents.
-pub fn to_typescript(doc: &SchemaTypes, emit_flags: &[EmitType]) -> Result<String> {
+pub fn to_typescript(doc: &SchemaTypes, cfg: &TypegenTsConfig) -> Result<String> {
 	let mut imports: BTreeSet<&'static str> = BTreeSet::new();
 	// Map of table names to their record Id types (as a string)
 	let mut body = String::new();
 
-	let mut emit_collection = EmitCollection::new(CollectFlags {
-		collect_defaults: emit_flags.contains(&EmitType::TableDefaults),
-		collect_unions: false,
-	});
+	let emit_flags = cfg.emit.clone().unwrap_or_default();
+	let overrides = cfg.overrides.clone().unwrap_or_default();
 
-	let emit_table_map = emit_flags.contains(&EmitType::TableMap);
-	let emit_table_names = emit_flags.contains(&EmitType::TableNames);
-	let emit_table_info = emit_table_map || emit_table_names;
-	let emit_consts = emit_flags.contains(&EmitType::Consts);
+	let table_union_name = overrides.table_names.unwrap_or("$TableName".to_string());
+	let table_map_name = overrides.table_map.unwrap_or("$TableMap".to_string());
+	let table_default_name = overrides.table_defaults.unwrap_or("$TableDefault".to_string());
+
+	let mut emitting = EmitCollection::new(CollectFlags {
+		collect_defaults: emit_flags.contains(&EmitType::TableDefaults),
+		collect_unions: emit_flags.contains(&EmitType::StringUnions),
+		emit_consts: emit_flags.contains(&EmitType::Consts),
+		emit_table_map: emit_flags.contains(&EmitType::TableMap),
+		emit_table_names: emit_flags.contains(&EmitType::TableNames),
+	}, overrides.field_sep);
+
+	let emit_table_info = emitting.flags.emit_table_map || emitting.flags.emit_table_names;
 
 	// Skip SurrealKit's internal bookkeeping tables (`__entity`, `__rollout`,
 	// …) — they are framework state, not user schema.
@@ -52,11 +59,30 @@ pub fn to_typescript(doc: &SchemaTypes, emit_flags: &[EmitType]) -> Result<Strin
 
 	let mut string_unions = StringUnionMap::new(true);
 
-	// Preload the record Id types
+	// Loop through all the tables once, extracting any needed data
 	for table in tables.clone() {
-		extract_record_id_type(table, &mut imports, &mut emit_collection);
+		let mut found_record = false;
+		for field in &table.fields {
+			if field.name == "id" {
+				let ts_type = field_type_to_ts(&field.r#type, &mut imports, &mut emitting, "");
+				emitting.add_record_type(table.name.clone(), ts_type);
+				found_record = true;
+			}
+			// let field_path = aggregate_path(&table.name, &field.name);
+			emitting.add_str_union(&table.name, field);
+			emitting.add_default(&table.name, field);
+		}
+		// Base case, assume it's a string
+		if !found_record {
+			emitting.add_record_type(table.name.clone(), "string".to_string());
+		}
+
 		if emit_table_info {
-			string_unions.add_to_union("$Table", &table.name, Some(emit_table_names));
+			string_unions.add_to_union(
+				&table_union_name,
+				&table.name,
+				Some(emitting.flags.emit_table_names),
+			);
 		}
 	}
 
@@ -64,33 +90,39 @@ pub fn to_typescript(doc: &SchemaTypes, emit_flags: &[EmitType]) -> Result<Strin
 		if idx > 0 {
 			body.push('\n');
 		}
-		render_table(table, &mut body, &mut imports, &mut emit_collection);
+		render_table(table, &mut body, &mut imports, &mut emitting);
 	}
 
-	if let Some(default_unions) = emit_collection.defaults {
-		if emit_collection.flags.collect_defaults {
+	// Print out all the collected unions
+	if let Some(collected_unions) = emitting.unions {
+		collected_unions.map.iter().for_each(|(_, u)| {
+			if !u.items.is_empty() {
+				// If type is empty, don't print it out
+				body.push_str(&u.to_emitted_string(emitting.flags.emit_consts))
+			}
+		});
+	}
+
+	if let Some(default_unions) = emitting.defaults {
+		if emitting.flags.collect_defaults {
 			body.push_str(&format!(
 				"\n{}\n",
-				default_unions.to_ts(
-					"$Table_Default",
-					emit_consts,
-					Some("$TableDefaults".to_string())
-				)
+				default_unions.to_ts(&table_default_name, emitting.flags.emit_consts),
 			));
 		}
 	}
 
-	if let Some(table_union) = string_unions.get_union("$Table") {
+	if let Some(table_union) = string_unions.get_union(&table_union_name) {
 		if emit_table_info {
 			// Create union of table names
-			if emit_consts {
-				body.push_str(&format!("\n{}\n", table_union.to_const_array()));
-			}
-			body.push_str(&format!("\n{}\n\n", table_union.to_type(emit_consts)));
+			body.push_str(&table_union.to_emitted_string(emitting.flags.emit_consts));
 
 			// Create type map of table names -> typescript interface
-			if emit_table_map {
-				body.push_str("export interface $TableMap extends Record<$Table, object> {\n\n");
+			if emitting.flags.emit_table_map {
+				body.push_str(&format!(
+					"export interface {} extends Record<{}, object> {{\n\n",
+					table_map_name, table_union_name
+				));
 				table_union
 					.items
 					.iter()
@@ -111,22 +143,6 @@ pub fn to_typescript(doc: &SchemaTypes, emit_flags: &[EmitType]) -> Result<Strin
 	Ok(out)
 }
 
-fn extract_record_id_type(
-	table: &TableDef,
-	imports: &mut BTreeSet<&'static str>,
-	collection: &mut EmitCollection,
-) {
-	for field in &table.fields {
-		if field.name == "id" {
-			let ts_type = field_type_to_ts(&field.r#type, imports, collection);
-			collection.add_record_type(table.name.clone(), ts_type);
-			return;
-		}
-	}
-	// Base case, assume it's a string
-	collection.add_record_type(table.name.clone(), "string".to_string());
-}
-
 fn render_table(
 	table: &TableDef,
 	out: &mut String,
@@ -141,9 +157,17 @@ fn render_table(
 		Some(t) => out.push_str(&format!("  id: RecordId<'{}', {}>;\n", table.name, t)),
 		None => out.push_str(&format!("  id: RecordId<'{}', string>;\n", table.name)),
 	}
-	let tree = build_field_tree(&table.fields, &table.name, collection);
+	let tree = build_field_tree(&table.fields);
 	for (name, node) in &tree.children {
-		render_node(name, node, 1, out, imports, collection);
+		render_node(
+			name,
+			node,
+			1,
+			out,
+			imports,
+			collection,
+			&collection.aggregate_path(&table.name, name),
+		);
 	}
 	out.push_str("}\n");
 }
@@ -171,11 +195,7 @@ struct Node {
 /// segment marks the *current* node as an array rather than introducing a
 /// child. The top-level `id` field (if introspected) is dropped — it is
 /// synthesized separately.
-fn build_field_tree(
-	fields: &[FieldDef],
-	table_name: &str,
-	collection: &mut EmitCollection,
-) -> Node {
+fn build_field_tree(fields: &[FieldDef]) -> Node {
 	let mut root = Node::default();
 	for field in fields {
 		let segments: Vec<&str> =
@@ -186,10 +206,6 @@ fn build_field_tree(
 		// Skip a synthesized-equivalent top-level `id` field.
 		if segments.len() == 1 && segments[0] == "id" {
 			continue;
-		}
-
-		if collection.flags.collect_defaults && field.has_default {
-			collection.add_default(table_name, &field.name);
 		}
 
 		let mut node = &mut root;
@@ -231,6 +247,7 @@ fn render_node(
 	out: &mut String,
 	imports: &mut BTreeSet<&'static str>,
 	collection: &mut EmitCollection,
+	node_path: &str,
 ) {
 	let indent = "  ".repeat(depth);
 	let optional = if node.own_optional {
@@ -239,7 +256,7 @@ fn render_node(
 		""
 	};
 	let key = format_key(name);
-	let ty = render_node_type(node, depth, imports, collection);
+	let ty = render_node_type(node, depth, imports, collection, node_path);
 	out.push_str(&format!("{indent}{key}{optional}: {ty};\n"));
 }
 
@@ -248,6 +265,7 @@ fn render_node_type(
 	depth: usize,
 	imports: &mut BTreeSet<&'static str>,
 	collection: &mut EmitCollection,
+	node_path: &str,
 ) -> String {
 	if !node.children.is_empty() {
 		let inner_indent = "  ".repeat(depth + 1);
@@ -260,7 +278,13 @@ fn render_node_type(
 				""
 			};
 			let key = format_key(name);
-			let ty = render_node_type(child, depth + 1, imports, collection);
+			let ty = render_node_type(
+				child,
+				depth + 1,
+				imports,
+				collection,
+				&collection.aggregate_path(node_path, name),
+			);
 			obj.push_str(&format!("{inner_indent}{key}{optional}: {ty};\n"));
 		}
 		obj.push_str(&format!("{close_indent}}}"));
@@ -273,9 +297,9 @@ fn render_node_type(
 			obj
 		}
 	} else if let Some(ty) = &node.own_type {
-		field_type_to_ts(ty, imports, collection)
+		field_type_to_ts(ty, imports, collection, node_path)
 	} else if let Some(elem) = &node.elem_type {
-		let inner = field_type_to_ts(elem, imports, collection);
+		let inner = field_type_to_ts(elem, imports, collection, node_path);
 		wrap_array(&inner)
 	} else {
 		"unknown".to_string()
@@ -288,60 +312,66 @@ fn field_type_to_ts(
 	ty: &FieldType,
 	imports: &mut BTreeSet<&'static str>,
 	collection: &mut EmitCollection,
+	field_path: &str,
 ) -> String {
-	match ty {
-		FieldType::Primitive {
-			name,
-		} => primitive_to_ts(*name, imports),
-		FieldType::Option {
-			inner,
-		} => {
-			format!("{} | undefined", field_type_to_ts(inner, imports, collection))
-		}
-		FieldType::Array {
-			inner,
-			..
-		}
-		| FieldType::Set {
-			inner,
-			..
-		} => wrap_array(&field_type_to_ts(inner, imports, collection)),
-		FieldType::Record {
-			tables,
-		} => {
-			imports.insert("RecordId");
-			if tables.is_empty() {
-				"RecordId".to_string()
-			} else {
-				tables
-					.iter()
-					.map(|t| match collection.record_types.get(t) {
-						Some(ty) => format!("RecordId<'{t}', {ty}>"),
-						None => format!("RecordId<'{t}'>"),
-					})
-					.collect::<Vec<_>>()
-					.join(" | ")
+	if let Some(alias_type) = collection.replacements.get(field_path) {
+		// If this value has been replaced with a type alias, use that instead
+		alias_type.clone()
+	} else {
+		match ty {
+			FieldType::Primitive {
+				name,
+			} => primitive_to_ts(*name, imports),
+			FieldType::Option {
+				inner,
+			} => {
+				format!("{} | undefined", field_type_to_ts(inner, imports, collection, field_path))
 			}
+			FieldType::Array {
+				inner,
+				..
+			}
+			| FieldType::Set {
+				inner,
+				..
+			} => wrap_array(&field_type_to_ts(inner, imports, collection, field_path)),
+			FieldType::Record {
+				tables,
+			} => {
+				imports.insert("RecordId");
+				if tables.is_empty() {
+					"RecordId".to_string()
+				} else {
+					tables
+						.iter()
+						.map(|t| match collection.record_types.get(t) {
+							Some(ty) => format!("RecordId<'{t}', {ty}>"),
+							None => format!("RecordId<'{t}'>"),
+						})
+						.collect::<Vec<_>>()
+						.join(" | ")
+				}
+			}
+			FieldType::Geometry {
+				kinds,
+			} => geometry_to_ts(kinds, imports),
+			FieldType::Literal {
+				value,
+			} => literal_to_ts(value),
+			FieldType::Union {
+				variants,
+			} => variants
+				.iter()
+				.map(|v| field_type_to_ts(v, imports, collection, field_path))
+				.collect::<Vec<_>>()
+				.join(" | "),
+			FieldType::Object {
+				fields,
+			} => object_to_ts(fields, imports, collection, field_path),
+			FieldType::Unknown {
+				..
+			} => "unknown".to_string(),
 		}
-		FieldType::Geometry {
-			kinds,
-		} => geometry_to_ts(kinds, imports),
-		FieldType::Literal {
-			value,
-		} => literal_to_ts(value),
-		FieldType::Union {
-			variants,
-		} => variants
-			.iter()
-			.map(|v| field_type_to_ts(v, imports, collection))
-			.collect::<Vec<_>>()
-			.join(" | "),
-		FieldType::Object {
-			fields,
-		} => object_to_ts(fields, imports, collection),
-		FieldType::Unknown {
-			..
-		} => "unknown".to_string(),
 	}
 }
 
@@ -402,6 +432,7 @@ fn object_to_ts(
 	fields: &[ObjectField],
 	imports: &mut BTreeSet<&'static str>,
 	collection: &mut EmitCollection,
+	field_path: &str,
 ) -> String {
 	if fields.is_empty() {
 		return "{ [key: string]: unknown }".to_string();
@@ -419,7 +450,12 @@ fn object_to_ts(
 				} else {
 					""
 				},
-				field_type_to_ts(&ty, imports, collection)
+				field_type_to_ts(
+					&ty,
+					imports,
+					collection,
+					&collection.aggregate_path(field_path, &f.name)
+				)
 			)
 		})
 		.collect::<Vec<_>>()
@@ -481,10 +517,7 @@ fn is_valid_identifier(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::typegen::{
-		string_union::pascal_case,
-		types::{FieldType, PrimitiveType},
-	};
+	use crate::typegen::types::{FieldType, PrimitiveType};
 
 	fn prim(name: PrimitiveType) -> FieldType {
 		FieldType::Primitive {
@@ -538,17 +571,9 @@ mod tests {
 	}
 
 	#[test]
-	fn pascal_case_variants() {
-		assert_eq!(pascal_case("user"), "User");
-		assert_eq!(pascal_case("user_profile"), "UserProfile");
-		assert_eq!(pascal_case("blog-post"), "BlogPost");
-		assert_eq!(pascal_case("User"), "User");
-	}
-
-	#[test]
 	fn table_becomes_interface_with_typed_id() {
 		let d = doc(vec![table("user", vec![field("name", prim(PrimitiveType::String), false)])]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("export interface User {"), "got:\n{ts}");
 		assert!(ts.contains("id: RecordId<'user', string>;"), "got:\n{ts}");
 		assert!(ts.contains("name: string;"), "got:\n{ts}");
@@ -559,7 +584,7 @@ mod tests {
 	fn optional_field_gets_question_mark() {
 		let d =
 			doc(vec![table("user", vec![field("nickname", prim(PrimitiveType::String), true)])]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("nickname?: string;"), "got:\n{ts}");
 	}
 
@@ -575,7 +600,7 @@ mod tests {
 				false,
 			)],
 		)]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("author: RecordId<'user'>;"), "got:\n{ts}");
 	}
 
@@ -592,7 +617,7 @@ mod tests {
 				false,
 			)],
 		)]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("tags: string[];"), "got:\n{ts}");
 	}
 
@@ -611,7 +636,7 @@ mod tests {
 				false,
 			)],
 		)]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("refs: (RecordId<'user'> | RecordId<'org'>)[];"), "got:\n{ts}");
 	}
 
@@ -634,7 +659,7 @@ mod tests {
 				false,
 			)],
 		)]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains(r#"status: "open" | "done";"#), "got:\n{ts}");
 	}
 
@@ -647,7 +672,7 @@ mod tests {
 				field("address.zip", prim(PrimitiveType::String), true),
 			],
 		)]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("address: {"), "got:\n{ts}");
 		assert!(ts.contains("city: string;"), "got:\n{ts}");
 		assert!(ts.contains("zip?: string;"), "got:\n{ts}");
@@ -669,7 +694,7 @@ mod tests {
 				field("addresses[*].street", prim(PrimitiveType::String), false),
 			],
 		)]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("addresses: ({"), "got:\n{ts}");
 		assert!(ts.contains("street: string;"), "got:\n{ts}");
 		assert!(ts.contains("})[];"), "got:\n{ts}");
@@ -685,7 +710,7 @@ mod tests {
 				field("amount", prim(PrimitiveType::Decimal), false),
 			],
 		)]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("at: Date;"), "got:\n{ts}");
 		assert!(ts.contains("dur: Duration;"), "got:\n{ts}");
 		assert!(ts.contains("amount: Decimal;"), "got:\n{ts}");
@@ -701,7 +726,7 @@ mod tests {
 			table("__entity", vec![field("key", prim(PrimitiveType::String), false)]),
 			table("user", vec![field("name", prim(PrimitiveType::String), false)]),
 		]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("export interface User {"), "got:\n{ts}");
 		assert!(!ts.contains("__entity"), "internal table leaked, got:\n{ts}");
 		assert!(!ts.contains("interface Entity"), "internal table leaked, got:\n{ts}");
@@ -710,7 +735,7 @@ mod tests {
 	#[test]
 	fn introspected_id_field_is_not_skipped() {
 		let d = doc(vec![table("user", vec![field("id", prim(PrimitiveType::Uuid), false)])]);
-		let ts = to_typescript(&d, &Vec::new()).unwrap();
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("id: RecordId<'user', Uuid>;"), "got:\n{ts}");
 		assert!(!ts.contains("id: string;"), "synthesized id must win, got:\n{ts}");
 	}

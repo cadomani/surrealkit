@@ -5,6 +5,7 @@ use surrealdb::opt::capabilities::Capabilities;
 use surrealkit::typegen::{
 	FieldType, PrimitiveType, TypegenOpts, format_file, generate, render_typescript, run_typegen,
 };
+use surrealkit::variables::TypegenTsConfig;
 
 async fn mem_db() -> Surreal<Any> {
 	let cfg = Config::new().capabilities(Capabilities::all());
@@ -136,7 +137,7 @@ async fn run_typegen_writes_valid_json_file() {
 			pretty: true,
 			ts_out: None,
 			ts_format: None,
-			ts_emit: None,
+			ts_opts: None,
 		},
 	)
 	.await
@@ -157,7 +158,7 @@ async fn render_typescript_emits_sdk_interfaces() {
 	define_schema(&db).await;
 
 	let doc = generate(&db).await.expect("generate");
-	let ts = render_typescript(&doc, &Vec::new()).expect("render ts");
+	let ts = render_typescript(&doc, &TypegenTsConfig::default()).expect("render ts");
 
 	// PascalCase interface + synthesized typed id.
 	assert!(ts.contains("export interface User {"), "got:\n{ts}");
@@ -194,7 +195,7 @@ async fn run_typegen_writes_typescript_file_when_configured() {
 			pretty: true,
 			ts_out: Some(ts_dir.clone()),
 			ts_format: None,
-			ts_emit: None,
+			ts_opts: None,
 		},
 	)
 	.await

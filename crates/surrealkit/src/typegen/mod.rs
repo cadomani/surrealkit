@@ -24,7 +24,7 @@ pub use types::{
 	SchemaTypes, TableDef,
 };
 
-use crate::variables::EmitType;
+use crate::variables::TypegenTsConfig;
 
 /// Options for the `typegen` command.
 #[derive(Debug, Clone, Default)]
@@ -41,14 +41,13 @@ pub struct TypegenOpts {
 	/// Optional formatter command run on the generated `index.ts` after writing.
 	/// Configured via `[typegen] format` in `surrealkit.toml`.
 	pub ts_format: Option<String>,
-	/// Optional vector of flags for emitting during ts generation
-	pub ts_emit: Option<Vec<EmitType>>,
+	pub ts_opts: Option<TypegenTsConfig>,
 }
 
 /// Render a [`SchemaTypes`] document as TypeScript. Re-exported so callers
 /// (e.g. the sync/watch loop) can emit types without re-introspecting.
-pub fn render_typescript(doc: &SchemaTypes, emit_flags: &[EmitType]) -> Result<String> {
-	emit::to_typescript(doc, emit_flags)
+pub fn render_typescript(doc: &SchemaTypes, cfg: &TypegenTsConfig) -> Result<String> {
+	emit::to_typescript(doc, cfg)
 }
 
 /// Write the TypeScript types for `doc` into `dir/index.ts`, creating `dir` if
@@ -56,9 +55,9 @@ pub fn render_typescript(doc: &SchemaTypes, emit_flags: &[EmitType]) -> Result<S
 pub fn write_typescript(
 	doc: &SchemaTypes,
 	dir: &std::path::Path,
-	emit_flags: &[EmitType],
+	ts_opts: &TypegenTsConfig,
 ) -> Result<PathBuf> {
-	let ts = emit::to_typescript(doc, emit_flags)?;
+	let ts: String = emit::to_typescript(doc, ts_opts)?;
 	std::fs::create_dir_all(dir)?;
 	let path = dir.join("index.ts");
 	std::fs::write(&path, ts)?;
@@ -72,9 +71,9 @@ pub fn write_typescript_formatted(
 	doc: &SchemaTypes,
 	dir: &std::path::Path,
 	format: Option<&str>,
-	emits: Vec<EmitType>,
+	ts_opts: &TypegenTsConfig,
 ) -> Result<PathBuf> {
-	let path = write_typescript(doc, dir, &emits)?;
+	let path = write_typescript(doc, dir, ts_opts)?;
 	if let Some(cmd) = format {
 		format_file(cmd, &path);
 	}
@@ -153,7 +152,7 @@ pub async fn run_typegen(
 			&doc,
 			ts_dir,
 			opts.ts_format.as_deref(),
-			opts.ts_emit.clone().unwrap_or_default(),
+			&opts.ts_opts.unwrap_or_default(),
 		)?;
 		log::info!("typegen: wrote {}", ts_path.display());
 	}
