@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb_types::{RecordId, RecordIdKey, SurrealValue, uuid};
+use surrealdb_types::{RecordId, RecordIdKey, SurrealValue, ToSql, uuid};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Semaphore;
@@ -20,7 +20,7 @@ use super::api::execute_api_case;
 use super::assertions::{JsonAssertionContext, assert_json_value_with_context};
 use super::types::{
 	AssertionReport, CaseKind, CaseReport, GlobalTestConfig, JsonAssertionSpec, LoadedSuite,
-	PermissionAction, RunReport, SuiteReport, TestOpts,
+	PermissionAction, RunReport, SchemaSource, SuiteReport, TestOpts,
 };
 use crate::config::{AuthLevel, DbCfg};
 use crate::core::create_surreal_client;
@@ -63,11 +63,20 @@ impl RunnerContext {
 		let started_at = OffsetDateTime::now_utc();
 		let run_start = Instant::now();
 
-		let suite_reports = if self.opts.parallel <= 1 {
-			self.run_sequential(suites).await?
-		} else {
-			self.run_parallel(suites).await?
-		};
+		let jobs = self.jobs(suites);
+		let mut suite_reports = Vec::new();
+		let replays = jobs.iter().any(|job| job.source == SchemaSource::Rollouts);
+		if replays && !self.opts.no_sync && self.global.rollouts.parity.unwrap_or(true) {
+			suite_reports.push(self.rollout_parity().await);
+		}
+		let parity_failed = suite_reports.iter().any(|report| report.cases_failed > 0);
+		if !(self.opts.fail_fast && parity_failed) {
+			suite_reports.extend(if self.opts.parallel <= 1 {
+				self.run_sequential(jobs).await?
+			} else {
+				self.run_parallel(jobs).await?
+			});
+		}
 
 		let suites_total = suite_reports.len();
 		let suites_failed = suite_reports.iter().filter(|s| s.cases_failed > 0).count();
@@ -89,10 +98,32 @@ impl RunnerContext {
 		})
 	}
 
-	async fn run_sequential(&self, suites: Vec<LoadedSuite>) -> Result<Vec<SuiteReport>> {
-		let mut reports = Vec::new();
+	/// Each suite once per schema source it runs against.
+	fn jobs(&self, suites: Vec<LoadedSuite>) -> Vec<SuiteJob> {
+		let mut jobs = Vec::new();
 		for suite in suites {
-			let report = self.run_suite(suite).await?;
+			let source = suite
+				.spec
+				.schema_from
+				.or(self.opts.schema_from)
+				.or(self.global.defaults.schema_from)
+				.unwrap_or(SchemaSource::Sync);
+			let labelled = source == SchemaSource::Both;
+			for &single in source.sources() {
+				jobs.push(SuiteJob {
+					suite: suite.clone(),
+					source: single,
+					labelled,
+				});
+			}
+		}
+		jobs
+	}
+
+	async fn run_sequential(&self, jobs: Vec<SuiteJob>) -> Result<Vec<SuiteReport>> {
+		let mut reports = Vec::new();
+		for job in jobs {
+			let report = self.run_suite(job).await?;
 			let failed = report.cases_failed > 0;
 			reports.push(report);
 			if self.opts.fail_fast && failed {
@@ -102,18 +133,18 @@ impl RunnerContext {
 		Ok(reports)
 	}
 
-	async fn run_parallel(&self, suites: Vec<LoadedSuite>) -> Result<Vec<SuiteReport>> {
+	async fn run_parallel(&self, jobs: Vec<SuiteJob>) -> Result<Vec<SuiteReport>> {
 		let mut reports = Vec::new();
 		let limit = self.opts.parallel.max(1);
 		let semaphore = Arc::new(Semaphore::new(limit));
 		let mut joinset = tokio::task::JoinSet::new();
 
-		for suite in suites {
+		for job in jobs {
 			let permit = semaphore.clone().acquire_owned().await?;
 			let ctx = self.clone_for_task();
 			joinset.spawn(async move {
 				let _permit = permit;
-				ctx.run_suite(suite).await
+				ctx.run_suite(job).await
 			});
 		}
 
@@ -139,7 +170,7 @@ impl RunnerContext {
 			}
 		}
 
-		reports.sort_by(|a, b| a.suite_file.cmp(&b.suite_file));
+		reports.sort_by(|a, b| (&a.suite_file, &a.suite_name).cmp(&(&b.suite_file, &b.suite_name)));
 		Ok(reports)
 	}
 
@@ -155,12 +186,9 @@ impl RunnerContext {
 		}
 	}
 
-	async fn run_suite(&self, suite: LoadedSuite) -> Result<SuiteReport> {
-		let started = Instant::now();
-		let suite_name =
-			suite.spec.name.clone().unwrap_or_else(|| suite.path.to_string_lossy().to_string());
-		let slug = slugify(&format!("{}-{}", suite_name, suite.path.display()));
-		let (namespace, database) = match self.cfg.auth_level() {
+	/// The isolated namespace and database for a suite, by slug.
+	fn suite_names(&self, slug: &str) -> (String, String) {
+		match self.cfg.auth_level() {
 			AuthLevel::Root => (
 				format!("{}_sk_test_{}_{}", self.cfg.ns(), self.run_id, slug),
 				format!("{}_sk_test_{}_{}", self.cfg.db(), self.run_id, slug),
@@ -172,11 +200,29 @@ impl RunnerContext {
 			AuthLevel::Database | AuthLevel::None => {
 				unreachable!("AuthLevel::Database/None are rejected by tester::run_test")
 			}
-		};
+		}
+	}
+
+	async fn run_suite(&self, job: SuiteJob) -> Result<SuiteReport> {
+		let SuiteJob {
+			suite,
+			source,
+			labelled,
+		} = job;
+		let started = Instant::now();
+		let mut suite_name =
+			suite.spec.name.clone().unwrap_or_else(|| suite.path.to_string_lossy().to_string());
+		let mut slug_source = format!("{}-{}", suite_name, suite.path.display());
+		if labelled {
+			suite_name = format!("{suite_name} [{}]", source.label());
+			slug_source = format!("{slug_source}-{}", source.label());
+		}
+		let slug = slugify(&slug_source);
+		let (namespace, database) = self.suite_names(&slug);
 		let host = self.cfg.host().to_string();
 		let base_url =
 			self.base_url.as_ref().map(|url| format!("{}/api/{}/{}", url, namespace, database));
-		let actors = self.prepare_suite(&suite, &host, &namespace, &database).await?;
+		let actors = self.prepare_suite(&suite, &host, &namespace, &database, source).await?;
 		let mut cases = Vec::new();
 
 		for case in &suite.spec.cases {
@@ -234,6 +280,7 @@ impl RunnerContext {
 		host: &str,
 		namespace: &str,
 		database: &str,
+		source: SchemaSource,
 	) -> Result<HashMap<String, ActorSession>> {
 		let merged = merged_actor_specs(&self.global.actors, &suite.spec.actors);
 		let bootstrap_actors =
@@ -244,29 +291,13 @@ impl RunnerContext {
 			run_setup(&root.db, self.cfg.folder()).await?;
 		}
 		if !self.opts.no_sync {
-			sync::run_sync(
-				&root.db,
-				SyncOpts {
-					watch: false,
-					debounce_ms: 250,
-					dry_run: false,
-					fail_fast: true,
-					prune: true,
-					allow_shared_prune: true,
-					allow_empty_prune: false,
-					allow_all_statements: false,
-					vars: self.vars.clone(),
-					folder: self.cfg.folder().to_owned(),
-					module: crate::module::Module::default_module(),
-					typegen_ts_out: None,
-					typegen_ts_format: None,
-					typegen_ts_opts: None
-				},
-			)
-			.await?;
+			self.build_schema(&root.db, source).await?;
 		}
 		if !self.opts.no_seed {
-			seed::seed(&root.db, self.cfg.folder(), &self.vars).await?;
+			seed::seed(&root.db, self.cfg.folder(), &self.vars).await.context(
+				"seeding the suite database; `surrealkit test --no-seed` skips this for a project \
+				 without seed files",
+			)?;
 		}
 
 		let tests_dir = PathBuf::from(self.cfg.folder()).join("tests");
@@ -291,11 +322,242 @@ impl RunnerContext {
 
 		Ok(actors)
 	}
+
+	/// Give a fresh suite database its schema, the way `source` says.
+	async fn build_schema(&self, db: &Surreal<Any>, source: SchemaSource) -> Result<()> {
+		match source {
+			SchemaSource::Sync | SchemaSource::Both => {
+				sync::run_sync(
+					db,
+					SyncOpts {
+						watch: false,
+						debounce_ms: 250,
+						dry_run: false,
+						fail_fast: true,
+						prune: true,
+						allow_shared_prune: true,
+						allow_empty_prune: false,
+						allow_all_statements: false,
+						vars: self.vars.clone(),
+						folder: self.cfg.folder().to_owned(),
+						module: crate::module::Module::default_module(),
+						typegen_ts_out: None,
+						typegen_ts_format: None,
+						typegen_json_out: None,
+						typegen_ts_opts: None
+					},
+				)
+				.await
+			}
+			SchemaSource::Rollouts => {
+				let report = crate::rollout::run_up(
+					db,
+					self.cfg.folder(),
+					crate::rollout::RolloutUpOpts {
+						complete_newest: true,
+						quiet: true,
+						..Default::default()
+					},
+					&self.vars,
+				)
+				.await
+				.context(
+					"replaying the rollouts into an empty suite database (schema_from = rollouts)",
+				)?;
+				if report.pending.is_empty() {
+					bail!(
+						"schema_from = rollouts, but there are no rollouts in {} to replay",
+						crate::constants::rollouts_dir(self.cfg.folder()).display()
+					);
+				}
+				Ok(())
+			}
+		}
+	}
+
+	/// Build one database with sync and one by replaying the rollouts, and report
+	/// every definition on which they disagree. A rollout chain that has fallen
+	/// behind the schema folder, or a frozen file that no longer says what the
+	/// folder says, shows up here instead of in production.
+	async fn rollout_parity(&self) -> SuiteReport {
+		let started = Instant::now();
+		let host = self.cfg.host().to_string();
+		let mut built = Vec::new();
+		let mut failure = None;
+		for source in [SchemaSource::Sync, SchemaSource::Rollouts] {
+			let (namespace, database) = self.suite_names(&format!("parity_{}", source.label()));
+			let attempt = async {
+				let actors =
+					build_actor_sessions(&self.cfg, &host, &namespace, &database, &BTreeMap::new())
+						.await?;
+				let db = require_actor(&actors, "root")?.db.clone();
+				run_setup(&db, self.cfg.folder()).await?;
+				self.build_schema(&db, source).await?;
+				describe_schema(&db).await
+			}
+			.await;
+			match attempt {
+				Ok(schema) => built.push(schema),
+				Err(err) => {
+					failure =
+						Some(format!("building the {} database failed: {err:#}", source.label()));
+				}
+			}
+			if !self.opts.keep_db
+				&& let Err(err) = cleanup_suite_db(&self.cfg, &host, &namespace, &database).await
+			{
+				log::warn!("failed to clean up parity db {namespace}/{database}: {err:#}");
+			}
+			if failure.is_some() {
+				break;
+			}
+		}
+
+		let assertions = match (&failure, built.as_slice()) {
+			(None, [synced, replayed]) => compare_schemas(synced, replayed),
+			_ => Vec::new(),
+		};
+		let passed = failure.is_none() && assertions.iter().all(|a| a.passed);
+		let case = CaseReport {
+			name: "replaying every rollout defines what sync defines".to_string(),
+			kind: "rollout_parity".to_string(),
+			duration_ms: started.elapsed().as_millis(),
+			passed,
+			message: failure.or_else(|| {
+				(!passed).then(|| {
+					"the rollouts and the schema folder disagree; plan a rollout for the difference \
+					 with `surrealkit rollout plan`"
+						.to_string()
+				})
+			}),
+			assertions,
+		};
+		SuiteReport {
+			suite_file: "rollouts".to_string(),
+			suite_name: "rollout parity".to_string(),
+			namespace: String::new(),
+			database: String::new(),
+			duration_ms: started.elapsed().as_millis(),
+			cases_total: 1,
+			cases_passed: usize::from(passed),
+			cases_failed: usize::from(!passed),
+			cases: vec![case],
+		}
+	}
 }
 
-fn get_record_id(record: &surrealdb_types::Object) -> Result<RecordId> {
-	let value = record.get("id").ok_or_else(|| anyhow!("Record has no id"))?;
-	value.as_record().cloned().ok_or_else(|| anyhow!("Record id is not a record"))
+/// One suite run against one schema source.
+#[derive(Debug, Clone)]
+struct SuiteJob {
+	suite: LoadedSuite,
+	source: SchemaSource,
+	/// Whether the suite runs once per source, so its report names the source.
+	labelled: bool,
+}
+
+/// Every definition in a database, keyed by kind and name, plus the entity
+/// catalog SurrealKit recorded for it. SurrealKit's own `__` tables are left out.
+async fn describe_schema(db: &Surreal<Any>) -> Result<BTreeMap<String, String>> {
+	let mut out = BTreeMap::new();
+	let db_info = info_object(db, "INFO FOR DB;", None).await?;
+	let mut tables = Vec::new();
+	for (section, items) in &db_info {
+		let Some(items) = items.as_object() else {
+			continue;
+		};
+		for (name, definition) in items {
+			if section == "tables" {
+				if name.starts_with("__") {
+					continue;
+				}
+				tables.push(name.clone());
+			}
+			out.insert(format!("{section}:{name}"), value_text(definition));
+		}
+	}
+	for table in tables {
+		let info = info_object(db, "INFO FOR TABLE $table;", Some(&table)).await?;
+		for (section, items) in &info {
+			if section == "lives" {
+				continue;
+			}
+			let Some(items) = items.as_object() else {
+				continue;
+			};
+			for (name, definition) in items {
+				out.insert(format!("{section}:{table}.{name}"), value_text(definition));
+			}
+		}
+	}
+	let mut response = db
+		.query("SELECT key, val.statement_hash AS hash FROM __entity WHERE ns = 'schema';")
+		.await?
+		.check()?;
+	let rows: Vec<Value> = response.take(0)?;
+	for row in rows {
+		if let (Some(key), Some(hash)) = (row.get("key").and_then(Value::as_str), row.get("hash")) {
+			out.insert(format!("catalog:{key}"), value_text(hash));
+		}
+	}
+	Ok(out)
+}
+
+async fn info_object(
+	db: &Surreal<Any>,
+	sql: &str,
+	table: Option<&str>,
+) -> Result<serde_json::Map<String, Value>> {
+	let mut query = db.query(sql);
+	if let Some(table) = table {
+		query = query.bind(("table", table.to_string()));
+	}
+	let mut response = query.await?.check()?;
+	let raw: surrealdb_types::Value = response.take(0)?;
+	Ok(Value::from_value(raw).ok().and_then(|v| v.as_object().cloned()).unwrap_or_default())
+}
+
+fn value_text(value: &Value) -> String {
+	value.as_str().map(str::to_string).unwrap_or_else(|| value.to_string())
+}
+
+/// One assertion per disagreement, and one that counts the agreements.
+fn compare_schemas(
+	synced: &BTreeMap<String, String>,
+	replayed: &BTreeMap<String, String>,
+) -> Vec<AssertionReport> {
+	let mut out = Vec::new();
+	let mut matching = 0usize;
+	let keys: std::collections::BTreeSet<&String> = synced.keys().chain(replayed.keys()).collect();
+	for key in keys {
+		match (synced.get(key), replayed.get(key)) {
+			(Some(a), Some(b)) if a == b => matching += 1,
+			(Some(a), Some(b)) => out.push(AssertionReport {
+				name: key.clone(),
+				passed: false,
+				message: format!("differs\n      sync:     {a}\n      rollouts: {b}"),
+			}),
+			(Some(_), None) => out.push(AssertionReport {
+				name: key.clone(),
+				passed: false,
+				message: "defined by sync but not by the rollouts".to_string(),
+			}),
+			(None, Some(_)) => out.push(AssertionReport {
+				name: key.clone(),
+				passed: false,
+				message: "defined by the rollouts but not by sync".to_string(),
+			}),
+			(None, None) => {}
+		}
+	}
+	out.insert(
+		0,
+		AssertionReport {
+			name: "matching definitions".to_string(),
+			passed: true,
+			message: format!("{matching} definitions agree"),
+		},
+	);
+	out
 }
 
 async fn get_record(
@@ -313,25 +575,49 @@ async fn delete_record(db: &Surreal<Any>, record_id: RecordId) -> Result<()> {
 	Ok(())
 }
 
-async fn copy_record(
-	root_db: &Surreal<Any>,
-	record_id: RecordId,
-) -> Result<surrealdb_types::Object> {
+/// What came of copying a record to a new id.
+enum Copied {
+	/// The copy, at a random id in the same table.
+	Made(RecordId),
+	/// The copy would duplicate the original in this unique index, so there is
+	/// none.
+	Collides(String),
+}
+
+async fn copy_record(root_db: &Surreal<Any>, record_id: RecordId) -> Result<Copied> {
 	let Some(mut content) = get_record(root_db, record_id.clone()).await? else {
 		bail!("Record {:?} cannot be copied", record_id);
 	};
 	let tmp_record_id = RecordId::new(record_id.table.clone(), RecordIdKey::rand());
 	content.remove("id");
-	root_db
+	let created = root_db
 		.query("CREATE $tmp_record_id CONTENT $content;")
 		.bind(("tmp_record_id", tmp_record_id.clone()))
 		.bind(("content", content))
 		.await?
-		.check()?;
-	match get_record(root_db, tmp_record_id).await? {
-		Some(record) => Ok(record),
+		.check();
+	if let Err(err) = created {
+		return match unique_index_conflict(&err.to_string()) {
+			Some(index) => Ok(Copied::Collides(index.to_string())),
+			None => Err(err.into()),
+		};
+	}
+	match get_record(root_db, tmp_record_id.clone()).await? {
+		Some(..) => Ok(Copied::Made(tmp_record_id)),
 		None => bail!("New record was not copied"),
 	}
+}
+
+/// The unique index a write was refused by, if `error` is SurrealDB saying the
+/// write would duplicate an entry in one.
+///
+/// SurrealDB sends this as an `Internal` error with no structured details, so
+/// the message is all there is to go on: "Database index `name` already
+/// contains 'value', with record `table:id`".
+fn unique_index_conflict(error: &str) -> Option<&str> {
+	let (_, rest) = error.split_once("Database index `")?;
+	let (index, rest) = rest.split_once('`')?;
+	rest.starts_with(" already contains ").then_some(index)
 }
 
 async fn add_marker_field(db: &Surreal<Any>, table: &str) -> Result<()> {
@@ -349,6 +635,9 @@ type AssertionResult = Result<(), AssertionError>;
 enum AssertionError {
 	PermissionThrow(String),
 	PermissionFailed(String),
+	/// The action was refused for a reason other than a permission, so the rule
+	/// says nothing about whether it is allowed. Fails the rule either way.
+	Inconclusive(String),
 	InternalError(anyhow::Error),
 }
 
@@ -379,6 +668,7 @@ impl std::fmt::Display for AssertionError {
 		match self {
 			AssertionError::PermissionThrow(error) => write!(f, "permission throw: {error}"),
 			AssertionError::PermissionFailed(error) => write!(f, "permission failed: {error}"),
+			AssertionError::Inconclusive(error) => write!(f, "inconclusive: {error}"),
 			AssertionError::InternalError(error) => write!(f, "internal error: {error}"),
 		}
 	}
@@ -408,14 +698,27 @@ async fn assert_permission_action_create(
 		.bind(("tmp_record_id", tmp_record_id.clone()))
 		.bind(("content", content))
 		.await?
-		.check()
-		.map_err(AssertionError::throw);
+		.check();
 
 	let record = get_record(root_db, tmp_record_id.clone()).await?;
 	if record.is_some() {
 		delete_record(root_db, tmp_record_id.clone()).await?;
 	}
-	create_result?;
+	if let Err(err) = create_result {
+		let text = err.to_string();
+		// The new record has the original's content, so a unique index refuses
+		// it. That is the index speaking, not a permission, so it is no denial.
+		return Err(match unique_index_conflict(&text) {
+			Some(index) => AssertionError::Inconclusive(format!(
+				"a record with the content of {} duplicates it in the unique index `{index}`, \
+				 so the index refused the create and this rule cannot tell whether it is \
+				 allowed; test create on this table with a sql_expect case that sets its own \
+				 unique values ({text})",
+				record_id.to_sql()
+			)),
+			None => AssertionError::throw(text),
+		});
+	}
 	match record {
 		None => Err(AssertionError::failed("New record was not created")),
 		Some(..) => Ok(()),
@@ -448,8 +751,16 @@ async fn assert_permission_action_update(
 	record_id: RecordId,
 ) -> AssertionResult {
 	add_marker_field(root_db, &record_id.table).await?;
-	let tmp_record = copy_record(root_db, record_id.clone()).await?;
-	let tmp_record_id = get_record_id(&tmp_record)?;
+	let tmp_record_id = match copy_record(root_db, record_id.clone()).await? {
+		Copied::Made(id) => id,
+		Copied::Collides(index) => {
+			log::debug!(
+				"a copy of {} collides in unique index `{index}`; updating it in place",
+				record_id.to_sql()
+			);
+			return assert_permission_action_update_in_place(user_db, root_db, record_id).await;
+		}
+	};
 	let new_marker = uuid::Uuid::new_v4().to_string();
 
 	// assert update permission
@@ -478,8 +789,16 @@ async fn assert_permission_action_delete(
 	root_db: &Surreal<Any>,
 	record_id: RecordId,
 ) -> AssertionResult {
-	let tmp_record = copy_record(root_db, record_id.clone()).await?;
-	let tmp_record_id = get_record_id(&tmp_record)?;
+	let tmp_record_id = match copy_record(root_db, record_id.clone()).await? {
+		Copied::Made(id) => id,
+		Copied::Collides(index) => {
+			log::debug!(
+				"a copy of {} collides in unique index `{index}`; deleting it in place",
+				record_id.to_sql()
+			);
+			return assert_permission_action_delete_in_place(user_db, root_db, record_id).await;
+		}
+	};
 
 	// assert delete permission
 	let delete_result = user_db
@@ -497,6 +816,109 @@ async fn assert_permission_action_delete(
 	match record {
 		None => Ok(()),
 		Some(..) => Err(AssertionError::failed("Record cannot be deleted")),
+	}
+}
+
+/// The record a `record_id = "$auth"` case acts on: the one `actor` is signed in
+/// as, which must be in the case's table.
+fn auth_record_for(
+	case: &str,
+	actor_name: &str,
+	actor: &ActorSession,
+	table: &str,
+) -> Result<RecordId> {
+	let Some(record) = actor.auth_record.clone() else {
+		bail!(
+			"permissions_matrix case '{case}' uses record_id = \"$auth\", but actor \
+			 '{actor_name}' is not signed in as a record (it needs `kind = \"record\"`)"
+		);
+	};
+	if record.table.as_str() != table {
+		bail!(
+			"permissions_matrix case '{case}' is for table '{table}', but actor '{actor_name}' is \
+			 signed in as {}, a record in '{}'",
+			actor.auth.as_ref().map(ToString::to_string).unwrap_or_default(),
+			record.table
+		);
+	}
+	Ok(record)
+}
+
+/// Update a record as the actor, then put it back as it was.
+///
+/// Used for `$auth`, where only the real record can satisfy a permission keyed
+/// on it, and for any record whose copy a unique index refuses. The restore runs
+/// as root with the record's original content, so a field computed with `VALUE`
+/// is recomputed then.
+async fn assert_permission_action_update_in_place(
+	user_db: &Surreal<Any>,
+	root_db: &Surreal<Any>,
+	record_id: RecordId,
+) -> AssertionResult {
+	add_marker_field(root_db, &record_id.table).await?;
+	let Some(mut original) = get_record(root_db, record_id.clone()).await? else {
+		return Err(AssertionError::throw(anyhow!("record {:?} does not exist", record_id)));
+	};
+	original.remove("id");
+	let new_marker = uuid::Uuid::new_v4().to_string();
+	let update_result = user_db
+		.query("UPDATE $record_id SET _marker = $new_marker;")
+		.bind(("record_id", record_id.clone()))
+		.bind(("new_marker", new_marker.clone()))
+		.await?
+		.check()
+		.map_err(AssertionError::throw);
+
+	let after = get_record(root_db, record_id.clone()).await?;
+	let marker = after.as_ref().and_then(|r| r.get("_marker")).and_then(|m| m.as_string()).cloned();
+	root_db
+		.query("UPDATE $record_id CONTENT $original;")
+		.bind(("record_id", record_id))
+		.bind(("original", original))
+		.await?
+		.check()?;
+	update_result?;
+	match marker {
+		Some(marker) if marker == new_marker => Ok(()),
+		_ => Err(AssertionError::failed("Record cannot be updated")),
+	}
+}
+
+/// Delete a record as the actor, then create it again as it was.
+///
+/// Used for `$auth`, and for any record whose copy a unique index refuses.
+/// Anything the delete cascaded to through `REFERENCE ... ON DELETE` is not put
+/// back.
+async fn assert_permission_action_delete_in_place(
+	user_db: &Surreal<Any>,
+	root_db: &Surreal<Any>,
+	record_id: RecordId,
+) -> AssertionResult {
+	let Some(mut original) = get_record(root_db, record_id.clone()).await? else {
+		return Err(AssertionError::throw(anyhow!("record {:?} does not exist", record_id)));
+	};
+	original.remove("id");
+	let delete_result = user_db
+		.query("DELETE $record_id;")
+		.bind(("record_id", record_id.clone()))
+		.await?
+		.check()
+		.map_err(AssertionError::throw);
+
+	let still_there = get_record(root_db, record_id.clone()).await?.is_some();
+	if !still_there {
+		root_db
+			.query("CREATE $record_id CONTENT $original;")
+			.bind(("record_id", record_id))
+			.bind(("original", original))
+			.await?
+			.check()?;
+	}
+	delete_result?;
+	if still_there {
+		Err(AssertionError::failed("Record cannot be deleted"))
+	} else {
+		Ok(())
 	}
 }
 
@@ -533,10 +955,20 @@ async fn run_case(
 			let actor_name = actor_name_or_default(spec.actor.as_deref());
 			let actor = require_actor(actors, actor_name)?;
 			let root = require_actor(actors, "root")?;
-			let record_id_key = RecordIdKey::String(
-				spec.record_id.clone().unwrap_or_else(|| "perm_record".to_string()),
-			);
-			let record_id = RecordId::new(spec.table.clone(), record_id_key);
+			// `$auth` is the record the actor is signed in as. Rules on it act on that
+			// record itself: a copy has another id, so a permission written as
+			// `WHERE id = $auth` could never match one.
+			let in_place = spec.record_id.as_deref() == Some("$auth");
+			let record_id = if in_place {
+				auth_record_for(&case.name, actor_name, actor, &spec.table)?
+			} else {
+				RecordId::new(
+					spec.table.clone(),
+					RecordIdKey::String(
+						spec.record_id.clone().unwrap_or_else(|| "perm_record".to_string()),
+					),
+				)
+			};
 
 			let mut assertions = Vec::new();
 			for (idx, rule) in spec.rules.iter().enumerate() {
@@ -548,8 +980,14 @@ async fn run_case(
 					PermissionAction::Select => {
 						assert_permission_action_select(&actor.db, rec_id).await
 					}
+					PermissionAction::Update if in_place => {
+						assert_permission_action_update_in_place(&actor.db, &root.db, rec_id).await
+					}
 					PermissionAction::Update => {
 						assert_permission_action_update(&actor.db, &root.db, rec_id).await
+					}
+					PermissionAction::Delete if in_place => {
+						assert_permission_action_delete_in_place(&actor.db, &root.db, rec_id).await
 					}
 					PermissionAction::Delete => {
 						assert_permission_action_delete(&actor.db, &root.db, rec_id).await
@@ -569,8 +1007,12 @@ async fn run_case(
 					return Err(error);
 				}
 
+				let label = rule
+					.name
+					.clone()
+					.unwrap_or_else(|| format!("action:{} (#{})", rule.action.label(), idx + 1));
 				let report = evaluate_outcome(
-					format!("action:{} (#{})", rule.action.label(), idx + 1),
+					label,
 					result,
 					rule.allow,
 					rule.error_contains.as_deref(),
@@ -801,6 +1243,14 @@ fn evaluate_outcome(
 	error_contains: Option<&str>,
 	error_code: Option<&str>,
 ) -> Result<AssertionReport> {
+	// Neither a pass nor a denial, whatever the rule expects.
+	if let Err(err @ AssertionError::Inconclusive(..)) = &result {
+		return Ok(AssertionReport {
+			name: label,
+			passed: false,
+			message: format!("{err}"),
+		});
+	}
 	match (allow, result) {
 		(true, Ok(_)) => Ok(AssertionReport {
 			name: label,
@@ -968,10 +1418,6 @@ mod tests {
 	use std::collections::{BTreeMap, HashMap};
 	use std::path::Path;
 
-	use surrealdb::engine::any::connect;
-	use surrealdb::opt::Config;
-	use surrealdb::opt::capabilities::Capabilities;
-
 	use super::super::actors::ActorSession;
 	use super::super::types::FixtureSpec;
 	use super::{apply_fixture, fixture_sql, slugify};
@@ -1001,12 +1447,7 @@ mod tests {
 		// verbatim because apply_fixture skipped TemplateVars::apply. Other fixture
 		// flows (rollouts, seeds, schema apply) already substitute, so behavior
 		// across flows was inconsistent.
-		let cfg = Config::new().capabilities(Capabilities::all());
-		let db = connect(("mem://", cfg)).await.expect("connect mem://");
-		db.use_ns("surrealkit_test")
-			.use_db("apply_fixture_substitution")
-			.await
-			.expect("use_ns/use_db");
+		let db = crate::test_db::fresh("apply_fixture_substitution").await;
 
 		let mut actors = HashMap::new();
 		actors.insert(
@@ -1015,6 +1456,7 @@ mod tests {
 				db: db.clone(),
 				headers: BTreeMap::new(),
 				auth: None,
+				auth_record: None,
 			},
 		);
 
@@ -1053,12 +1495,7 @@ mod tests {
 		// When a fixture references a variable that wasn't provided, the failure
 		// should surface as an error from apply_fixture (not silently send `${...}`
 		// to the DB, where it would fail with a confusing syntax/parser error).
-		let cfg = Config::new().capabilities(Capabilities::all());
-		let db = connect(("mem://", cfg)).await.expect("connect mem://");
-		db.use_ns("surrealkit_test")
-			.use_db("apply_fixture_undefined_var")
-			.await
-			.expect("use_ns/use_db");
+		let db = crate::test_db::fresh("apply_fixture_undefined_var").await;
 
 		let mut actors = HashMap::new();
 		actors.insert(
@@ -1067,6 +1504,7 @@ mod tests {
 				db: db.clone(),
 				headers: BTreeMap::new(),
 				auth: None,
+				auth_record: None,
 			},
 		);
 
@@ -1082,5 +1520,209 @@ mod tests {
 			.expect_err("undefined variable must error");
 		let msg = err.to_string();
 		assert!(msg.contains("missing-var"), "error should name the fixture: {err}");
+	}
+
+	#[test]
+	fn unique_index_conflict_reads_the_index_from_surrealdb_errors() {
+		use super::unique_index_conflict;
+		let message = "Database index `account_email` already contains 'seeded@example.test', \
+		               with record `account:seeded`";
+		assert_eq!(unique_index_conflict(message), Some("account_email"));
+		// However the error was wrapped on the way here.
+		assert_eq!(
+			unique_index_conflict(&format!("internal error: query failed: {message}")),
+			Some("account_email")
+		);
+		// A composite index reports an array of values.
+		assert_eq!(
+			unique_index_conflict(
+				"Database index `by_ns_key` already contains ['schema', 'table:a'], with record \
+				 `__entity:x`"
+			),
+			Some("by_ns_key")
+		);
+		for other in [
+			"Permission denied: You are not allowed to access this resource",
+			"Database record `account:seeded` already exists",
+			"Found 'x' for field `email`, with record `account:a`, but expected a string",
+			"Database index `account_email` does not exist",
+		] {
+			assert_eq!(unique_index_conflict(other), None, "{other}");
+		}
+	}
+
+	#[test]
+	fn an_inconclusive_rule_fails_whatever_it_expects() {
+		use super::{AssertionError, evaluate_outcome};
+		for allow in [true, false] {
+			let report = evaluate_outcome(
+				"rule".into(),
+				Err(AssertionError::Inconclusive("the index refused it".into())),
+				allow,
+				None,
+				None,
+			)
+			.unwrap();
+			assert!(!report.passed, "allow = {allow}");
+			assert_eq!(report.message, "inconclusive: the index refused it");
+		}
+		// `error_contains` matching the text does not turn it into a denial.
+		let report = evaluate_outcome(
+			"rule".into(),
+			Err(AssertionError::Inconclusive("index".into())),
+			false,
+			Some("index"),
+			None,
+		)
+		.unwrap();
+		assert!(!report.passed);
+	}
+
+	/// `handle` has a unique index, `plain` has none. Without signing in, the
+	/// embedded engine lets a session do anything, so the root session stands in
+	/// for an actor who is allowed every action.
+	async fn unique_and_plain_tables(
+		label: &str,
+	) -> surrealdb::Surreal<surrealdb::engine::any::Any> {
+		let db = crate::test_db::fresh(label).await;
+		db.query(
+			"DEFINE TABLE handle SCHEMAFULL;
+			DEFINE FIELD name ON handle TYPE string;
+			DEFINE INDEX handle_name ON handle FIELDS name UNIQUE;
+			DEFINE TABLE plain SCHEMAFULL;
+			DEFINE FIELD name ON plain TYPE string;
+			CREATE handle:taken SET name = 'taken';
+			CREATE plain:kept SET name = 'kept';",
+		)
+		.await
+		.unwrap()
+		.check()
+		.unwrap();
+		db
+	}
+
+	async fn rows(
+		db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+		table: &str,
+	) -> Vec<serde_json::Value> {
+		let mut response =
+			db.query(format!("SELECT * FROM {table} ORDER BY id;")).await.unwrap().check().unwrap();
+		response.take(0).unwrap()
+	}
+
+	fn rid(table: &str, key: &str) -> surrealdb_types::RecordId {
+		surrealdb_types::RecordId::new(
+			table.to_string(),
+			surrealdb_types::RecordIdKey::String(key.to_string()),
+		)
+	}
+
+	fn expect_ok(result: super::AssertionResult) {
+		if let Err(err) = result {
+			panic!("expected the action to be allowed, got {err}");
+		}
+	}
+
+	#[tokio::test]
+	async fn a_copy_that_collides_in_a_unique_index_is_reported_not_raised() {
+		use super::{Copied, copy_record};
+		let db = unique_and_plain_tables("copy_collides").await;
+
+		match copy_record(&db, rid("handle", "taken")).await.unwrap() {
+			Copied::Collides(index) => assert_eq!(index, "handle_name"),
+			Copied::Made(id) => panic!("copied to {id:?} despite the unique index"),
+		}
+		assert_eq!(rows(&db, "handle").await.len(), 1, "a failed copy leaves nothing behind");
+
+		match copy_record(&db, rid("plain", "kept")).await.unwrap() {
+			Copied::Made(id) => assert_ne!(id, rid("plain", "kept")),
+			Copied::Collides(index) => panic!("no unique index on plain, yet collided in {index}"),
+		}
+	}
+
+	#[tokio::test]
+	async fn update_and_delete_fall_back_to_the_record_itself_and_restore_it() {
+		use super::{assert_permission_action_delete, assert_permission_action_update};
+		let db = unique_and_plain_tables("unique_fallback").await;
+		let before = rows(&db, "handle").await;
+
+		expect_ok(assert_permission_action_update(&db, &db, rid("handle", "taken")).await);
+		expect_ok(assert_permission_action_delete(&db, &db, rid("handle", "taken")).await);
+
+		assert_eq!(rows(&db, "handle").await, before, "the record is back as it was");
+	}
+
+	#[tokio::test]
+	async fn tables_without_a_unique_index_still_work_on_a_copy() {
+		use super::{assert_permission_action_delete, assert_permission_action_update};
+		let db = unique_and_plain_tables("plain_copy").await;
+		// A delete event shows which record was deleted: with a copy, never the original.
+		db.query(
+			"DEFINE TABLE gone SCHEMALESS;
+			DEFINE EVENT plain_gone ON plain WHEN $event = 'DELETE' THEN (CREATE gone SET was = $before.id);",
+		)
+		.await
+		.unwrap()
+		.check()
+		.unwrap();
+		let before = rows(&db, "plain").await;
+
+		expect_ok(assert_permission_action_update(&db, &db, rid("plain", "kept")).await);
+		expect_ok(assert_permission_action_delete(&db, &db, rid("plain", "kept")).await);
+
+		assert_eq!(rows(&db, "plain").await, before);
+		let mut response =
+			db.query("SELECT VALUE record::id(was) FROM gone;").await.unwrap().check().unwrap();
+		let deleted: Vec<String> = response.take(0).unwrap();
+		assert!(!deleted.is_empty(), "the copies were deleted");
+		assert!(!deleted.contains(&"kept".to_string()), "the original was deleted: {deleted:?}");
+	}
+
+	#[tokio::test]
+	async fn a_create_that_collides_in_a_unique_index_is_inconclusive() {
+		use super::{AssertionError, assert_permission_action_create};
+		let db = unique_and_plain_tables("create_collides").await;
+
+		match assert_permission_action_create(&db, &db, rid("handle", "taken")).await {
+			Err(AssertionError::Inconclusive(message)) => {
+				assert!(message.contains("unique index `handle_name`"), "{message}");
+				assert!(message.contains("handle:taken"), "{message}");
+			}
+			Err(err) => panic!("expected an inconclusive result, got {err}"),
+			Ok(()) => panic!("a duplicate of handle:taken was created"),
+		}
+		assert_eq!(rows(&db, "handle").await.len(), 1);
+
+		expect_ok(assert_permission_action_create(&db, &db, rid("plain", "kept")).await);
+		assert_eq!(rows(&db, "plain").await.len(), 1, "the created record is cleaned up");
+	}
+
+	#[test]
+	fn compare_schemas_lists_every_disagreement() {
+		let synced: BTreeMap<String, String> = [
+			("tables:a".to_string(), "DEFINE TABLE a".to_string()),
+			("tables:b".to_string(), "DEFINE TABLE b".to_string()),
+			("fields:a.x".to_string(), "DEFINE FIELD x ON a TYPE int".to_string()),
+		]
+		.into();
+		let replayed: BTreeMap<String, String> = [
+			("tables:a".to_string(), "DEFINE TABLE a".to_string()),
+			("fields:a.x".to_string(), "DEFINE FIELD x ON a TYPE string".to_string()),
+			("tables:c".to_string(), "DEFINE TABLE c".to_string()),
+		]
+		.into();
+		let out = super::compare_schemas(&synced, &replayed);
+		assert!(out[0].passed && out[0].message == "1 definitions agree");
+		let failing: Vec<(&str, &str)> = out
+			.iter()
+			.filter(|a| !a.passed)
+			.map(|a| (a.name.as_str(), a.message.as_str()))
+			.collect();
+		assert_eq!(failing.len(), 3);
+		assert!(failing.iter().any(|(n, m)| *n == "fields:a.x"
+			&& m.contains("TYPE int")
+			&& m.contains("TYPE string")));
+		assert!(failing.contains(&("tables:b", "defined by sync but not by the rollouts")));
+		assert!(failing.contains(&("tables:c", "defined by the rollouts but not by sync")));
 	}
 }

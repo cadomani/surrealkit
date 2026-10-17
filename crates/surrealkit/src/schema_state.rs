@@ -251,19 +251,31 @@ pub fn ensure_local_state_dirs(folder: &str) -> Result<()> {
 }
 
 pub fn collect_schema_files(folder: &str) -> Result<Vec<SchemaFile>> {
-	collect_schema_files_at(&schema_dir(folder))
+	collect_schema_files_at(folder, &schema_dir(folder))
 }
 
 /// Collect `.surql` files from an explicit directory, recursively and in sorted
 /// order. Used by module-aware callers, which resolve the directory through
 /// [`Layout`](crate::constants::Layout) rather than the project folder.
-pub fn collect_schema_files_at(sd: &std::path::Path) -> Result<Vec<SchemaFile>> {
+///
+/// `root` is the project folder. Tracking keys are relative to it, so the same
+/// file yields the same key no matter where the process runs from.
+pub fn collect_schema_files_at(root: &str, sd: &std::path::Path) -> Result<Vec<SchemaFile>> {
 	if !sd.exists() {
 		return Ok(Vec::new());
 	}
 
+	// A schema directory configured to enclose the project folder (say
+	// `path = "."`) also encloses `rollouts/`, where each rollout keeps frozen
+	// copies of old schema files. Those are history, not schema; applying them
+	// would resurrect whatever they define.
+	let frozen_root = rollouts_dir(root);
 	let mut files = Vec::new();
-	for entry in WalkDir::new(sd).follow_links(true) {
+	let walker = WalkDir::new(sd)
+		.follow_links(true)
+		.into_iter()
+		.filter_entry(|entry| entry.path() != frozen_root);
+	for entry in walker {
 		let entry = entry.with_context(|| format!("walking schema directory {}", sd.display()))?;
 		if entry.file_type().is_file()
 			&& entry.path().extension().and_then(|suffix| suffix.to_str()) == Some("surql")
@@ -278,7 +290,7 @@ pub fn collect_schema_files_at(sd: &std::path::Path) -> Result<Vec<SchemaFile>> 
 	for path in files {
 		let sql = fs::read_to_string(&path).with_context(|| format!("reading {:?}", path))?;
 		let hash = sha256_hex(sql.as_bytes());
-		let path_str = normalize_path(&path)?;
+		let path_str = folder_relative_key(root, &path)?;
 		out.push(SchemaFile {
 			path: path_str,
 			sql,
@@ -309,14 +321,175 @@ pub fn hash_schema_snapshot(snapshot: &SchemaSnapshot) -> Result<String> {
 	Ok(sha256_hex(&canonical))
 }
 
+/// Map a path a manifest recorded onto the canonical key it should have been
+/// written as, together with the prefix it carried.
+///
+/// `/database/schema/a.surql` against `schema/a.surql` yields
+/// `("schema/a.surql", "/database")`. A path already canonical yields an empty
+/// prefix, and so does one rooted at `/`, which is a real prefix and not an
+/// absent one.
+///
+/// Longest match wins, matching [`canonicalise_keys`]: with modules, both
+/// `schema/a.surql` and `modules/billing/schema/a.surql` are suffixes of the same
+/// legacy key, and taking the first would bind it to the wrong module and apply
+/// the wrong file.
+pub fn canonicalise_recorded_path(
+	recorded: &str,
+	canonical: &[String],
+) -> Option<(String, String)> {
+	let key = canonical
+		.iter()
+		.filter(|candidate| is_legacy_key_for(recorded, candidate))
+		.max_by_key(|candidate| candidate.len())?;
+	let prefix = recorded.strip_suffix(key.as_str())?.trim_end_matches('/').to_string();
+	Some((key.clone(), prefix))
+}
+
+/// The hashes a pre-1.0.0-beta.2 manifest could carry for this same content.
+///
+/// `hash_schema_snapshot` includes each file's path, and paths used to be
+/// working-directory-relative, so a manifest planned in one environment hashes
+/// differently from the same schema read in another.
+///
+/// `legacy_prefixes` are recovered from the paths the manifest itself recorded,
+/// which is the only reliable source: the spelling belongs to whichever machine
+/// ran `plan`, so a manifest planned in a container carries `/database` while the
+/// folder here is somewhere else entirely. The configured folder is tried too,
+/// for a manifest that recorded no paths to recover from.
+///
+/// Pure by design. This sits on the path that reports a hash mismatch, and an
+/// unreadable file here would replace that actionable error with an I/O one.
+#[doc(hidden)]
+pub fn legacy_schema_hashes(
+	snapshot: &SchemaSnapshot,
+	folder: &str,
+	legacy_prefixes: &[String],
+) -> Result<Vec<String>> {
+	let trimmed = folder.trim_end_matches('/');
+	let bare = trimmed.strip_prefix("./").unwrap_or(trimmed);
+	let basename = Path::new(bare).file_name().and_then(|n| n.to_str()).unwrap_or(bare);
+
+	let mut prefixes: Vec<&str> = Vec::new();
+	for prefix in legacy_prefixes.iter().map(String::as_str).chain([bare, trimmed, basename]) {
+		if !prefixes.contains(&prefix) {
+			prefixes.push(prefix);
+		}
+	}
+
+	let mut out = Vec::new();
+	for prefix in prefixes {
+		let mut legacy = SchemaSnapshot {
+			version: snapshot.version,
+			files: snapshot
+				.files
+				.iter()
+				.map(|f| SchemaSnapshotEntry {
+					// An empty prefix is the filesystem root, not an absent one.
+					path: format!("{prefix}/{}", f.path),
+					hash: f.hash.clone(),
+				})
+				.collect(),
+		};
+		legacy.files.sort();
+		let hash = hash_schema_snapshot(&legacy)?;
+		if !out.contains(&hash) {
+			out.push(hash);
+		}
+	}
+	Ok(out)
+}
+
+/// Verify a manifest's recorded schema hash against the current files.
+///
+/// Accepts the canonical hash, or a pre-1.0.0-beta.2 path-dependent one with a
+/// warning naming the manifest. `legacy_prefixes` come from
+/// [`canonicalise_recorded_path`] over the paths the manifest recorded.
+#[doc(hidden)]
+pub fn verify_schema_hash(
+	snapshot: &SchemaSnapshot,
+	folder: &str,
+	recorded: &str,
+	rollout_id: &str,
+	legacy_prefixes: &[String],
+) -> Result<()> {
+	let current = hash_schema_snapshot(snapshot)?;
+	if current == recorded {
+		return Ok(());
+	}
+	if legacy_schema_hashes(snapshot, folder, legacy_prefixes)?.iter().any(|h| h == recorded) {
+		log::warn!(
+			"rollout '{rollout_id}' carries a pre-1.0.0-beta.2 schema hash, which depended on \
+			 the working directory. Accepting it for now -- re-run `surrealkit rollout plan` to \
+			 regenerate the manifest. This fallback is removed in 1.1.0."
+		);
+		return Ok(());
+	}
+	bail!("target schema hash mismatch for '{rollout_id}': manifest={recorded}, current={current}");
+}
+
 pub fn load_schema_snapshot(folder: &str) -> Result<SchemaSnapshot> {
-	load_json_or_default(
+	let mut snapshot: SchemaSnapshot = load_json_or_default(
 		schema_snapshot_path(folder),
 		SchemaSnapshot {
 			version: 1,
 			files: Vec::new(),
 		},
-	)
+	)?;
+	// Committed snapshots written before 1.0.0-beta.2 carry working-directory
+	// paths, which differ between a developer's checkout and CI. Normalise on load
+	// so the diff is not polluted by the spelling; `plan` and `baseline` write the
+	// canonical form back, so the file itself is rewritten the next time either
+	// runs.
+	for entry in &mut snapshot.files {
+		entry.path = strip_folder_prefix(folder, &entry.path);
+	}
+	snapshot.files.sort();
+	Ok(snapshot)
+}
+
+/// Drop a legacy folder prefix from a stored key, leaving it folder-relative.
+///
+/// Handles the spellings a pre-1.0.0-beta.2 build could produce:
+/// `database/schema/x`, `./database/schema/x` and `/database/schema/x`.
+///
+/// Deliberately conservative. It only strips a prefix that matches the configured
+/// folder, because it is applied to every snapshot entry on load and an
+/// over-eager match mangles keys that are already correct: a project whose folder
+/// is named `schema` would see `schema/a.surql` reduced to `a.surql`, and a
+/// basename search anywhere in the path would fire on an interior `schema/database/`
+/// directory. Both leave `run_plan` diffing a mangled old snapshot against a
+/// canonical new one, so every file reads as removed-plus-added.
+pub fn strip_folder_prefix(folder: &str, stored: &str) -> String {
+	let trimmed = folder.trim_end_matches('/');
+	let bare = trimmed.strip_prefix("./").unwrap_or(trimmed);
+	// A leading `./` is noise on either side and never part of a key.
+	let candidate = stored.strip_prefix("./").unwrap_or(stored);
+
+	// The folder and the stored key can disagree about absoluteness: a container
+	// with `SURREALDB_FOLDER=/database` writes `/database/...`, a checkout
+	// configured with `database` writes `database/...`, and the snapshot file is
+	// committed and read by both. Try the same folder spelled either way.
+	// Searching for the folder's name anywhere in the path is a different thing
+	// and is not safe, so it is not done.
+	let relative = bare.trim_start_matches('/');
+	let absolute = format!("/{relative}");
+
+	for prefix in [trimmed, bare, relative, absolute.as_str()] {
+		if prefix.is_empty() || prefix == "/" {
+			continue;
+		}
+		let Some(rest) = candidate.strip_prefix(prefix).and_then(|r| r.strip_prefix('/')) else {
+			continue;
+		};
+		// Every canonical key has a directory component: `schema/x.surql`,
+		// `seed/x.surql`, `modules/<name>/schema/x.surql`. A strip that leaves a
+		// bare filename has eaten one, which is what happens when the folder shares
+		// its name with the key's first segment (a project folder called `schema`).
+		if rest.contains('/') {
+			return rest.to_string();
+		}
+	}
+	stored.to_string()
 }
 
 pub fn save_schema_snapshot(folder: &str, snapshot: &SchemaSnapshot) -> Result<()> {
@@ -324,14 +497,24 @@ pub fn save_schema_snapshot(folder: &str, snapshot: &SchemaSnapshot) -> Result<(
 }
 
 pub fn load_catalog_snapshot(folder: &str) -> Result<CatalogSnapshot> {
-	load_json_or_default(
+	let mut snapshot: CatalogSnapshot = load_json_or_default(
 		catalog_snapshot_path(folder),
 		CatalogSnapshot {
 			version: 2,
 			entities: Vec::new(),
 			operations: Vec::new(),
 		},
-	)
+	)?;
+	// `source_path` is informational for the diff (entities key on kind/scope/name),
+	// but it is written straight back out, so normalising here keeps the committed
+	// file from churning between a checkout and a container.
+	for entity in &mut snapshot.entities {
+		entity.source_path = strip_folder_prefix(folder, &entity.source_path);
+	}
+	for op in &mut snapshot.operations {
+		op.source_path = strip_folder_prefix(folder, &op.source_path);
+	}
+	Ok(snapshot)
 }
 
 pub fn save_catalog_snapshot(folder: &str, snapshot: &CatalogSnapshot) -> Result<()> {
@@ -400,24 +583,24 @@ pub fn parse_schema_statements(
 	file: &SchemaFile,
 	allow_all_statements: bool,
 ) -> Result<(Vec<CatalogEntity>, Vec<Operation>)> {
+	let src = file.sql.as_str();
+	let statements = crate::surql_scan::scan(src)
+		.map_err(|err| anyhow!("schema file '{}': {err}", file.path))?;
 	let mut entities = Vec::new();
 	let mut operations = Vec::new();
-	for stmt in split_statements(&strip_comments(&file.sql)) {
-		let normalized = stmt.trim();
-		if normalized.is_empty() {
-			continue;
-		}
-		let upper = normalized.to_ascii_uppercase();
-		if upper.starts_with("REMOVE ") {
+	for stmt in &statements {
+		let stripped = stmt.stripped(src);
+		let normalized = stripped.trim();
+		if stmt.is_word(src, 0, "REMOVE") {
 			bail!(
 				"schema file '{}' contains a REMOVE statement; destructive SQL must live in rollout steps",
 				file.path
 			);
 		}
-		if upper.starts_with("LET ") {
+		if stmt.is_word(src, 0, "LET") {
 			continue;
 		}
-		if !upper.starts_with("DEFINE ") {
+		if !stmt.is_word(src, 0, "DEFINE") {
 			if allow_all_statements {
 				operations.push(Operation {
 					sql: normalized.to_string(),
@@ -426,23 +609,24 @@ pub fn parse_schema_statements(
 				continue;
 			}
 			bail!(
-				"schema file '{}' contains a non-DEFINE statement: '{}'",
+				"schema file '{}' contains a non-DEFINE statement at line {}: '{}'",
 				file.path,
+				stmt.line,
 				truncate_stmt(normalized)
 			);
 		}
-		let after_define = upper["DEFINE ".len()..].trim_start();
-		if after_define.starts_with("NAMESPACE") || after_define.starts_with("DATABASE") {
+		if stmt.is_word(src, 1, "NAMESPACE") || stmt.is_word(src, 1, "DATABASE") {
 			bail!(
 				"schema file '{}' contains DEFINE NAMESPACE/DATABASE, which surrealkit does not manage: \
 sync runs inside an already-selected namespace/database. Provision these out-of-band.",
 				file.path
 			);
 		}
-		let Some(mut entity) = parse_define_entity(normalized) else {
+		let Some(mut entity) = parse_define_entity(stmt, src) else {
 			bail!(
-				"schema file '{}' contains an unsupported DEFINE statement: '{}'",
+				"schema file '{}' contains an unsupported DEFINE statement at line {}: '{}'",
 				file.path,
+				stmt.line,
 				truncate_stmt(normalized)
 			);
 		};
@@ -452,6 +636,101 @@ sync runs inside an already-selected namespace/database. Provision these out-of-
 		entities.push(entity);
 	}
 	Ok((entities, operations))
+}
+
+/// Whether a recorded name or scope is a fragment of a quoted identifier.
+///
+/// Before 1.0.0-beta.6 the catalog split statements on whitespace, so
+/// `` DEFINE TABLE `my table` `` was recorded as the table `` `my ``. Such a
+/// fragment does not scan as SurrealQL, which is how it is recognised.
+fn is_garbled(text: &str) -> bool {
+	crate::surql_scan::scan(text).is_err()
+}
+
+/// Whether `full` is what the old splitter cut down to `fragment`: it starts
+/// with it, and the rest begins with whitespace.
+fn cut_from(fragment: &str, full: &str) -> bool {
+	full.strip_prefix(fragment)
+		.and_then(|rest| rest.chars().next())
+		.is_some_and(char::is_whitespace)
+}
+
+/// What [`reconcile_garbled`] does with a garbled entry it cannot match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unmatched {
+	/// Drop it. Right when `desired` is the whole schema: then nothing defines
+	/// it any more, and a fragment cannot be removed by name.
+	Drop,
+	/// Keep it. Right when `desired` is only part of the schema, such as the
+	/// files one rollout changes, so a missing match proves nothing.
+	Keep,
+}
+
+/// Repair catalog entries an older release recorded under a garbled name.
+///
+/// Each garbled entry in `recorded` is renamed to the entry in `desired` it was
+/// cut from, so it reads as the same entity rather than one removed and one
+/// added (which sync would prune, and `rollout plan` would refuse as a rename).
+/// What happens to one with no match is `unmatched`'s call. Returns the original
+/// keys of every renamed or dropped entry, so callers can clear their catalog
+/// rows.
+pub(crate) fn reconcile_garbled(
+	recorded: &mut Vec<CatalogEntity>,
+	desired: &[CatalogEntity],
+	unmatched: Unmatched,
+) -> Vec<EntityKey> {
+	let mut repaired = Vec::new();
+	recorded.retain_mut(|entity| {
+		let name_garbled = is_garbled(&entity.name);
+		let scope_garbled = entity.scope.as_deref().is_some_and(is_garbled);
+		if !name_garbled && !scope_garbled {
+			return true;
+		}
+		let matches = |candidate: &&CatalogEntity| {
+			candidate.kind == entity.kind
+				&& if name_garbled {
+					cut_from(&entity.name, &candidate.name)
+				} else {
+					candidate.name == entity.name
+				} && match (&entity.scope, &candidate.scope) {
+				(Some(old), Some(new)) if scope_garbled => cut_from(old, new),
+				(old, new) => old == new,
+			}
+		};
+		match desired.iter().find(matches) {
+			Some(found) => {
+				repaired.push(entity.key());
+				log::warn!(
+					"catalog entry {}:{}:{} was recorded by an older SurrealKit that cut the quoted \
+					 name short; it is {}:{}:{}",
+					entity.kind,
+					entity.scope.as_deref().unwrap_or(""),
+					entity.name,
+					found.kind,
+					found.scope.as_deref().unwrap_or(""),
+					found.name
+				);
+				entity.name.clone_from(&found.name);
+				entity.scope.clone_from(&found.scope);
+				true
+			}
+			None if unmatched == Unmatched::Keep => true,
+			None => {
+				repaired.push(entity.key());
+				log::warn!(
+					"dropping catalog entry {}:{}:{}: an older SurrealKit recorded it under a cut-short \
+					 quoted name, and no schema file defines anything it could be",
+					entity.kind,
+					entity.scope.as_deref().unwrap_or(""),
+					entity.name
+				);
+				false
+			}
+		}
+	});
+	recorded.sort();
+	recorded.dedup_by(|a, b| a.key() == b.key());
+	repaired
 }
 
 pub fn catalog_snapshot_to_map(snapshot: &CatalogSnapshot) -> BTreeMap<EntityKey, CatalogEntity> {
@@ -581,10 +860,97 @@ fn removal_sort_key(entity: &EntityKey) -> (usize, Option<String>, String, Strin
 	(weight, entity.scope.clone(), entity.kind.to_string(), entity.name.clone())
 }
 
-fn normalize_path(path: &Path) -> Result<String> {
-	let cwd = std::env::current_dir().context("resolving current directory")?;
-	let rel = path.strip_prefix(&cwd).or_else(|_| path.strip_prefix(".")).unwrap_or(path);
-	Ok(rel.to_string_lossy().replace('\\', "/"))
+/// The stable tracking key for a file inside the project folder: its path
+/// relative to `root`, forward-slashed.
+///
+/// Through 1.0.0-beta.1 this stripped the process **working directory** instead,
+/// so the same file was keyed `database/schema/a.surql` from a repo root but
+/// `/database/schema/a.surql` inside a container whose `WORKDIR` was not `/`.
+/// Every consumer of these keys — the `__entity` sync hashes, `__seed`, the
+/// committed snapshots, and a manifest's `target_schema_hash` — then disagreed
+/// across environments. Keying on `root` removes the working directory from the
+/// equation entirely.
+pub fn folder_relative_key(root: &str, path: &Path) -> Result<String> {
+	let root_path = Path::new(root);
+	if let Ok(rel) = path.strip_prefix(root_path) {
+		return Ok(slashed(rel));
+	}
+	// The walked path and the configured root can be spelled differently (`./db`
+	// vs `db`, relative vs absolute). Canonicalising both settles it; if either
+	// side cannot be canonicalised, fall back to the path as given.
+	if let (Ok(abs_root), Ok(abs_path)) = (root_path.canonicalize(), path.canonicalize())
+		&& let Ok(rel) = abs_path.strip_prefix(&abs_root)
+	{
+		return Ok(slashed(rel));
+	}
+	Ok(slashed(path))
+}
+
+fn slashed(path: &Path) -> String {
+	path.to_string_lossy().replace('\\', "/")
+}
+
+/// Whether `stored` is a pre-1.0.0-beta.2 spelling of the folder-relative key
+/// `canonical`.
+///
+/// Legacy keys were the canonical key behind some prefix — `database/`,
+/// `./database/`, `/database/`, or any working-directory-relative path. Matching
+/// on a trailing path-segment boundary covers all of them without the code
+/// needing to know the historical folder or working directory.
+pub fn is_legacy_key_for(stored: &str, canonical: &str) -> bool {
+	if stored == canonical {
+		return true;
+	}
+	stored.strip_suffix(canonical).is_some_and(|prefix| prefix.ends_with('/'))
+}
+
+/// Rewrite a map of stored keys onto canonical ones, reporting what moved.
+///
+/// Returns `(canonicalised, re_keyed)` where `re_keyed` pairs each legacy key
+/// with the canonical key it matched, so the caller can migrate the store and
+/// say how many rows it touched.
+pub fn canonicalise_keys<V: Clone>(
+	stored: &BTreeMap<String, V>,
+	canonical: &[String],
+) -> (BTreeMap<String, V>, Vec<(String, String)>) {
+	let mut out = BTreeMap::new();
+	let mut re_keyed = Vec::new();
+
+	// Exact matches first, and they win. A database can hold both a canonical row
+	// and a legacy one for the same file, which is the mixed CLI/embedded state
+	// this migration exists for, and the canonical row carries the current hash.
+	// Resolving that by iteration order would let a stale legacy hash overwrite it
+	// whenever the folder name happened to sort after the canonical key.
+	for (key, value) in stored {
+		if canonical.iter().any(|c| c == key) {
+			out.insert(key.clone(), value.clone());
+		}
+	}
+
+	for (key, value) in stored {
+		if out.contains_key(key) {
+			continue;
+		}
+		// Longest match wins. With modules, `modules/billing/schema/a.surql` and
+		// `schema/a.surql` are both suffixes of a legacy absolute key, and picking
+		// whichever came first would bind it to the wrong module.
+		match canonical.iter().filter(|c| is_legacy_key_for(key, c)).max_by_key(|c| c.len()) {
+			// Already carried by a canonical row: retire the legacy key without
+			// touching the live hash.
+			Some(target) if out.contains_key(target) => {
+				re_keyed.push((key.clone(), target.clone()));
+			}
+			Some(target) => {
+				re_keyed.push((key.clone(), target.clone()));
+				out.insert(target.clone(), value.clone());
+			}
+			// No match: a genuinely removed file. Keep it so prune still sees it.
+			None => {
+				out.insert(key.clone(), value.clone());
+			}
+		}
+	}
+	(out, re_keyed)
 }
 
 fn load_json_or_default<T>(path: impl AsRef<std::path::Path>, default: T) -> Result<T>
@@ -614,174 +980,252 @@ where
 	Ok(())
 }
 
-/// Ensures every `DEFINE` statement includes the `OVERWRITE` modifier so that
-/// sync can re-apply schemas idempotently against an existing database.
-pub fn ensure_overwrite(sql: &str) -> String {
-	let stmts = split_statements(&strip_comments(sql));
-	let mut out = Vec::with_capacity(stmts.len());
-	for stmt in stmts {
-		let trimmed = stmt.trim();
-		if trimmed.is_empty() {
+/// SurrealQL ready to apply, from [`prepare_schema_sql`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct PreparedSql {
+	/// The statements, each terminated with `;` on its own line.
+	pub sql: String,
+	/// How many statements `sql` holds.
+	pub statements: usize,
+	/// Things the caller should tell the user about, with the file or step they
+	/// came from.
+	pub warnings: Vec<PrepareWarning>,
+}
+
+/// Something worth telling the user about a statement [`prepare_schema_sql`]
+/// prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PrepareWarning {
+	/// `DEFINE SEQUENCE ... OVERWRITE` resets the sequence to its `START`, so every
+	/// apply re-issues values that are already in use.
+	SequenceOverwrite {
+		name: String,
+		line: u32,
+	},
+	/// A record access method with no explicit JWT key gets a new random signing
+	/// key from every `OVERWRITE`, which invalidates every token it has issued.
+	KeylessRecordAccess {
+		name: String,
+		line: u32,
+	},
+}
+
+impl fmt::Display for PrepareWarning {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::SequenceOverwrite {
+				name,
+				line,
+			} => write!(
+				f,
+				"line {line}: sequence `{name}` is defined with OVERWRITE, which resets it to its \
+				 START every time it is applied (immediately on SurrealDB 3.3, after a restart or \
+				 its cached batch on 3.2) and re-issues values already in use. Drop OVERWRITE to \
+				 let SurrealKit apply it with IF NOT EXISTS"
+			),
+			Self::KeylessRecordAccess {
+				name,
+				line,
+			} => write!(
+				f,
+				"line {line}: record access `{name}` has no JWT key, so SurrealDB generates a new \
+				 random one each time it is applied with OVERWRITE, and every session token it \
+				 issued stops working. Give it a stable key, e.g. \
+				 `WITH JWT ALGORITHM HS512 KEY ${{JWT_SECRET}}`"
+			),
+		}
+	}
+}
+
+/// Make a schema file's `DEFINE` statements safe to apply again.
+///
+/// Sync and rollouts re-apply whole files, so each `DEFINE` needs a modifier
+/// that tolerates the object already existing:
+///
+/// - Most kinds get `OVERWRITE`, and an explicit `IF NOT EXISTS` becomes
+///   `OVERWRITE` too, so a changed definition is actually applied.
+/// - `DEFINE SEQUENCE` is the exception. A sequence's definition carries state:
+///   `OVERWRITE` resets its counter to `START`, and the ids it hands out next
+///   collide with records that already exist. A plain `DEFINE SEQUENCE` gets
+///   `IF NOT EXISTS`, an explicit `IF NOT EXISTS` is kept, and an explicit
+///   `OVERWRITE` is kept as written with a [`PrepareWarning::SequenceOverwrite`].
+///
+/// The modifier is spliced in by position, so everything else, comments and
+/// regex literals included, reaches the server exactly as written. Non-`DEFINE`
+/// statements pass through unchanged.
+pub fn prepare_schema_sql(sql: &str) -> Result<PreparedSql> {
+	let statements = crate::surql_scan::scan(sql).map_err(|err| anyhow!("{err}"))?;
+	let mut out = String::with_capacity(sql.len() + statements.len() * 16);
+	let mut warnings = Vec::new();
+	for stmt in &statements {
+		let text = stmt.text(sql);
+		let Some(head) = define_head(stmt, sql) else {
+			out.push_str(text);
+			out.push_str(";\n");
 			continue;
-		}
-		let upper = trimmed.to_ascii_uppercase();
-		if upper.starts_with("DEFINE ") {
-			let tokens: Vec<&str> = trimmed.splitn(4, char::is_whitespace).collect();
-			// tokens: ["DEFINE", "<KIND>", ...]
-			if tokens.len() >= 3 {
-				let after_kind = &trimmed[tokens[0].len()..].trim_start();
-				let after_kind_word = &after_kind[tokens[1].len()..].trim_start();
-				let rest_upper = after_kind_word.to_ascii_uppercase();
-				if rest_upper.starts_with("OVERWRITE") {
-					out.push(format!("{};", trimmed));
-				} else if rest_upper.starts_with("IF NOT EXISTS") {
-					// Replace IF NOT EXISTS with OVERWRITE so sync always applies the latest
-					// schema; IF NOT EXISTS would silently skip updates to existing entities.
-					let after_ine = after_kind_word["IF NOT EXISTS".len()..].trim_start();
-					out.push(format!("DEFINE {} OVERWRITE {};", tokens[1], after_ine));
-				} else {
-					out.push(format!("DEFINE {} OVERWRITE {};", tokens[1], after_kind_word));
-				}
-			} else {
-				out.push(format!("{};", trimmed));
+		};
+		let kind = stmt.tok_text(sql, head.kind_index).unwrap_or_default();
+		let name = || ident_at(stmt, sql, head.name_index).unwrap_or_default();
+		let is_sequence = kind.eq_ignore_ascii_case("SEQUENCE");
+		let replacement = match (is_sequence, head.modifier) {
+			(true, DefineModifier::None) => Some(" IF NOT EXISTS"),
+			(true, DefineModifier::IfNotExists) => None,
+			(true, DefineModifier::Overwrite) => {
+				warnings.push(PrepareWarning::SequenceOverwrite {
+					name: name(),
+					line: stmt.line,
+				});
+				None
 			}
-		} else {
-			out.push(format!("{};", trimmed));
+			(false, DefineModifier::None) => Some(" OVERWRITE"),
+			(false, DefineModifier::IfNotExists) => Some("OVERWRITE"),
+			(false, DefineModifier::Overwrite) => None,
+		};
+		// Every kind but a sequence is applied with OVERWRITE.
+		if !is_sequence
+			&& kind.eq_ignore_ascii_case("ACCESS")
+			&& is_keyless_record_access(stmt, sql)
+		{
+			warnings.push(PrepareWarning::KeylessRecordAccess {
+				name: name(),
+				line: stmt.line,
+			});
 		}
+		match replacement {
+			Some(replacement) => {
+				let span = &head.modifier_span;
+				out.push_str(&sql[stmt.span.start..span.start]);
+				out.push_str(replacement);
+				out.push_str(&sql[span.end..stmt.span.end]);
+			}
+			None => out.push_str(text),
+		}
+		out.push_str(";\n");
 	}
-	out.join("\n")
+	Ok(PreparedSql {
+		sql: out,
+		statements: statements.len(),
+		warnings,
+	})
 }
 
-fn strip_comments(sql: &str) -> String {
-	let mut out = String::with_capacity(sql.len());
-	let mut chars = sql.chars().peekable();
-	let mut in_single = false;
-	let mut in_double = false;
-	let mut in_backtick = false;
-	let mut prev_escape = false;
+/// Whether a `DEFINE ACCESS` is a record (or bearer-for-record) access method
+/// with no `WITH JWT` clause, which leaves SurrealDB to pick a random key.
+fn is_keyless_record_access(stmt: &crate::surql_scan::Stmt, src: &str) -> bool {
+	let n = stmt.tokens.len();
+	let record = (0..n).any(|i| {
+		(stmt.is_word(src, i, "TYPE") || stmt.is_word(src, i, "FOR"))
+			&& stmt.is_word(src, i + 1, "RECORD")
+	});
+	let explicit_jwt =
+		(0..n).any(|i| stmt.is_word(src, i, "WITH") && stmt.is_word(src, i + 1, "JWT"));
+	record && !explicit_jwt
+}
 
-	while let Some(ch) = chars.next() {
-		let in_string = in_single || in_double || in_backtick;
-		if !in_string && !prev_escape {
-			// Line comments: --, //, #
-			if (ch == '-' || ch == '/') && chars.peek() == Some(&ch) {
-				chars.next();
-				for c in chars.by_ref() {
-					if c == '\n' {
-						out.push('\n');
-						break;
-					}
-				}
-				prev_escape = false;
-				continue;
-			}
-			if ch == '#' {
-				for c in chars.by_ref() {
-					if c == '\n' {
-						out.push('\n');
-						break;
-					}
-				}
-				prev_escape = false;
-				continue;
-			}
-			// Block comment: /* ... */ (non-nesting, preserves newlines so line numbers stay sane)
-			if ch == '/' && chars.peek() == Some(&'*') {
-				chars.next();
-				let mut prev = '\0';
-				for c in chars.by_ref() {
-					if c == '\n' {
-						out.push('\n');
-					}
-					if prev == '*' && c == '/' {
-						break;
-					}
-					prev = c;
-				}
-				out.push(' ');
-				prev_escape = false;
-				continue;
+/// The names of sequences these files define with an explicit `OVERWRITE`, the
+/// only form [`prepare_schema_sql`] lets reset a counter.
+pub(crate) fn overwrite_sequences(files: &[SchemaFile]) -> BTreeSet<String> {
+	let mut out = BTreeSet::new();
+	for file in files {
+		let Ok(statements) = crate::surql_scan::scan(&file.sql) else {
+			continue;
+		};
+		for stmt in &statements {
+			if let Some(head) = define_head(stmt, &file.sql)
+				&& stmt.is_word(&file.sql, head.kind_index, "SEQUENCE")
+				&& head.modifier == DefineModifier::Overwrite
+				&& let Some(name) = ident_at(stmt, &file.sql, head.name_index)
+			{
+				out.insert(name);
 			}
 		}
-
-		match ch {
-			'\'' if !in_double && !in_backtick && !prev_escape => in_single = !in_single,
-			'"' if !in_single && !in_backtick && !prev_escape => in_double = !in_double,
-			'`' if !in_single && !in_double && !prev_escape => in_backtick = !in_backtick,
-			_ => {}
-		}
-		prev_escape = ch == '\\' && !prev_escape;
-		out.push(ch);
 	}
 	out
 }
 
-fn split_statements(sql: &str) -> Vec<String> {
-	let mut out = Vec::new();
-	let mut buf = String::new();
-	let mut in_single = false;
-	let mut in_double = false;
-	let mut in_backtick = false;
-	let mut prev_escape = false;
-	let mut brace_depth = 0usize;
-
-	for ch in sql.chars() {
-		match ch {
-			'\'' if !in_double && !in_backtick && !prev_escape => in_single = !in_single,
-			'"' if !in_single && !in_backtick && !prev_escape => in_double = !in_double,
-			'`' if !in_single && !in_double && !prev_escape => in_backtick = !in_backtick,
-			'{' if !in_single && !in_double && !in_backtick => brace_depth += 1,
-			'}' if !in_single && !in_double && !in_backtick && brace_depth > 0 => brace_depth -= 1,
-			';' if !in_single && !in_double && !in_backtick && brace_depth == 0 => {
-				let stmt = buf.trim();
-				if !stmt.is_empty() {
-					out.push(stmt.to_string());
-				}
-				buf.clear();
-				prev_escape = false;
-				continue;
+/// Ensures every `DEFINE` statement can be re-applied. See [`prepare_schema_sql`],
+/// which this wraps: it logs the warnings, and on SurrealQL it cannot read it
+/// logs that too and returns the input unchanged, so the server reports the
+/// problem.
+#[deprecated(note = "use prepare_schema_sql, which returns its warnings and errors")]
+pub fn ensure_overwrite(sql: &str) -> String {
+	match prepare_schema_sql(sql) {
+		Ok(prepared) => {
+			for warning in &prepared.warnings {
+				log::warn!("{warning}");
 			}
-			_ => {}
+			prepared.sql
 		}
-
-		prev_escape = ch == '\\' && !prev_escape;
-		buf.push(ch);
+		Err(err) => {
+			log::warn!("could not prepare SQL for re-apply, sending it unchanged: {err:#}");
+			sql.to_string()
+		}
 	}
-
-	let tail = buf.trim();
-	if !tail.is_empty() {
-		out.push(tail.to_string());
-	}
-
-	out
 }
 
-fn parse_define_entity(stmt: &str) -> Option<CatalogEntity> {
-	let tokens = tokenize(stmt);
-	if tokens.len() < 3 || !eq(tokens[0], "DEFINE") {
+/// The `DEFINE` modifier a statement carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DefineModifier {
+	None,
+	Overwrite,
+	IfNotExists,
+}
+
+/// Where a `DEFINE` statement's modifier sits: what it is, the token index of
+/// the name that follows it, and the byte range it occupies (empty, right after
+/// the kind keyword, when there is none).
+pub(crate) struct DefineHead {
+	pub kind_index: usize,
+	pub modifier: DefineModifier,
+	pub modifier_span: std::ops::Range<usize>,
+	pub name_index: usize,
+}
+
+/// Locate the kind, modifier and name of a `DEFINE <kind>` statement.
+pub(crate) fn define_head(stmt: &crate::surql_scan::Stmt, src: &str) -> Option<DefineHead> {
+	use crate::surql_scan::TokKind;
+	if !stmt.is_word(src, 0, "DEFINE") || stmt.tokens.get(1)?.kind != TokKind::Word {
 		return None;
 	}
+	let kind_end = stmt.tokens[1].span.end;
+	let (modifier, modifier_span, name_index) = if stmt.is_word(src, 2, "OVERWRITE") {
+		(DefineModifier::Overwrite, stmt.tokens[2].span.clone(), 3)
+	} else if stmt.is_word(src, 2, "IF")
+		&& stmt.is_word(src, 3, "NOT")
+		&& stmt.is_word(src, 4, "EXISTS")
+	{
+		(DefineModifier::IfNotExists, stmt.tokens[2].span.start..stmt.tokens[4].span.end, 5)
+	} else {
+		(DefineModifier::None, kind_end..kind_end, 2)
+	};
+	Some(DefineHead {
+		kind_index: 1,
+		modifier,
+		modifier_span,
+		name_index,
+	})
+}
 
-	let kind = EntityKind::from_str(tokens[1]).ok()?;
-	let mut idx = 2;
-	idx = skip_modifiers(&tokens, idx);
-	if idx >= tokens.len() {
+fn parse_define_entity(stmt: &crate::surql_scan::Stmt, src: &str) -> Option<CatalogEntity> {
+	let head = define_head(stmt, src)?;
+	let kind = EntityKind::from_str(stmt.tok_text(src, head.kind_index)?).ok()?;
+	let idx = head.name_index;
+	if idx >= stmt.tokens.len() {
 		return None;
 	}
 
 	let (scope, name) = match &kind {
-		EntityKind::Table => (None, clean_ident(tokens[idx])),
+		EntityKind::Table => (None, ident_at(stmt, src, idx)?),
 		EntityKind::Field | EntityKind::Event | EntityKind::Index => {
-			let name = clean_ident(tokens[idx]);
-			let on_idx = find_token(&tokens, idx + 1, "ON")?;
+			let name = ident_at(stmt, src, idx)?;
+			let on_idx = find_word(stmt, src, idx + 1, "ON")?;
 			let mut scope_idx = on_idx + 1;
-			if scope_idx < tokens.len() && eq(tokens[scope_idx], "TABLE") {
+			if stmt.is_word(src, scope_idx, "TABLE") {
 				scope_idx += 1;
 			}
-			if scope_idx >= tokens.len() {
-				return None;
-			}
-			(Some(clean_ident(tokens[scope_idx])), name)
+			(Some(ident_at(stmt, src, scope_idx)?), name)
 		}
 		EntityKind::Function
 		| EntityKind::Param
@@ -791,17 +1235,11 @@ fn parse_define_entity(stmt: &str) -> Option<CatalogEntity> {
 		| EntityKind::Model
 		| EntityKind::Sequence
 		| EntityKind::Config
-		| EntityKind::Module => (None, clean_ident(tokens[idx])),
+		| EntityKind::Module => (None, ident_at(stmt, src, idx)?),
 		EntityKind::Access | EntityKind::User => {
-			let name = clean_ident(tokens[idx]);
-			let scope = find_token(&tokens, idx + 1, "ON").and_then(|on_idx| {
-				let i = on_idx + 1;
-				if i < tokens.len() {
-					Some(clean_ident(tokens[i]))
-				} else {
-					None
-				}
-			});
+			let name = ident_at(stmt, src, idx)?;
+			let scope = find_word(stmt, src, idx + 1, "ON")
+				.and_then(|on_idx| ident_at(stmt, src, on_idx + 1));
 			(scope, name)
 		}
 		_ => return None,
@@ -817,39 +1255,31 @@ fn parse_define_entity(stmt: &str) -> Option<CatalogEntity> {
 	})
 }
 
-fn tokenize(stmt: &str) -> Vec<&str> {
-	stmt.split_whitespace().collect()
-}
-
-fn clean_ident(token: &str) -> String {
-	let trimmed = token.trim_matches(|c: char| {
-		c == ',' || c == ';' || c == '(' || c == ')' || c == '{' || c == '}'
-	});
-	let core = match trimmed.find('(') {
-		Some(pos) => &trimmed[..pos],
-		None => trimmed,
-	};
-	core.to_string()
-}
-
-fn skip_modifiers(tokens: &[&str], mut idx: usize) -> usize {
-	while idx < tokens.len()
-		&& (eq(tokens[idx], "OVERWRITE")
-			|| eq(tokens[idx], "IF")
-			|| eq(tokens[idx], "NOT")
-			|| eq(tokens[idx], "EXISTS"))
-	{
-		idx += 1;
+/// The identifier starting at token `idx`: that token plus every token written
+/// directly against it, so `a.b[*]`, `fn::greet` and `ml::model<1.0.0>` come back
+/// whole. It stops at whitespace and at `( , ; { } )`, which is where the old
+/// whitespace split and its trimming used to cut a name.
+fn ident_at(stmt: &crate::surql_scan::Stmt, src: &str, idx: usize) -> Option<String> {
+	let is_stop =
+		|i: usize| matches!(stmt.tok_text(src, i), Some("(" | ")" | "," | ";" | "{" | "}"));
+	let first = stmt.tokens.get(idx)?;
+	if is_stop(idx) {
+		return None;
 	}
-	idx
+	let mut end = first.span.end;
+	let mut next = idx + 1;
+	while let Some(tok) = stmt.tokens.get(next) {
+		if tok.span.start != end || is_stop(next) {
+			break;
+		}
+		end = tok.span.end;
+		next += 1;
+	}
+	Some(src[first.span.start..end].to_string())
 }
 
-fn find_token(tokens: &[&str], start: usize, target: &str) -> Option<usize> {
-	(start..tokens.len()).find(|&i| eq(tokens[i], target))
-}
-
-fn eq(value: &str, expected: &str) -> bool {
-	value.eq_ignore_ascii_case(expected)
+fn find_word(stmt: &crate::surql_scan::Stmt, src: &str, start: usize, word: &str) -> Option<usize> {
+	(start..stmt.tokens.len()).find(|&i| stmt.is_word(src, i, word))
 }
 
 fn normalize_statement(stmt: &str) -> String {
@@ -871,18 +1301,256 @@ fn normalize_statement(stmt: &str) -> String {
 
 fn truncate_stmt(stmt: &str) -> String {
 	const LIMIT: usize = 96;
-	if stmt.len() <= LIMIT {
-		stmt.to_string()
-	} else {
-		format!("{}...", &stmt[..LIMIT])
+	match stmt.char_indices().nth(LIMIT) {
+		// Cut on a character boundary: slicing at a byte offset panicked when a
+		// multi-byte character such as `⟨` straddled it.
+		Some((cut, _)) => format!("{}...", &stmt[..cut]),
+		None => stmt.to_string(),
+	}
+}
+
+/// The comment stripper and splitter this module used before `surql_scan`, kept
+/// so tests can prove the new pipeline produces the same entity keys and hashes
+/// wherever the old one read a file correctly.
+#[cfg(test)]
+pub(crate) mod legacy {
+	pub(crate) fn strip_comments(sql: &str) -> String {
+		let mut out = String::with_capacity(sql.len());
+		let mut chars = sql.chars().peekable();
+		let mut in_single = false;
+		let mut in_double = false;
+		let mut in_backtick = false;
+		let mut prev_escape = false;
+
+		while let Some(ch) = chars.next() {
+			let in_string = in_single || in_double || in_backtick;
+			if !in_string && !prev_escape {
+				// Line comments: --, //, #
+				if (ch == '-' || ch == '/') && chars.peek() == Some(&ch) {
+					chars.next();
+					for c in chars.by_ref() {
+						if c == '\n' {
+							out.push('\n');
+							break;
+						}
+					}
+					prev_escape = false;
+					continue;
+				}
+				if ch == '#' {
+					for c in chars.by_ref() {
+						if c == '\n' {
+							out.push('\n');
+							break;
+						}
+					}
+					prev_escape = false;
+					continue;
+				}
+				// Block comment: /* ... */ (non-nesting, preserves newlines so line numbers stay sane)
+				if ch == '/' && chars.peek() == Some(&'*') {
+					chars.next();
+					let mut prev = '\0';
+					for c in chars.by_ref() {
+						if c == '\n' {
+							out.push('\n');
+						}
+						if prev == '*' && c == '/' {
+							break;
+						}
+						prev = c;
+					}
+					out.push(' ');
+					prev_escape = false;
+					continue;
+				}
+			}
+
+			match ch {
+				'\'' if !in_double && !in_backtick && !prev_escape => in_single = !in_single,
+				'"' if !in_single && !in_backtick && !prev_escape => in_double = !in_double,
+				'`' if !in_single && !in_double && !prev_escape => in_backtick = !in_backtick,
+				_ => {}
+			}
+			prev_escape = ch == '\\' && !prev_escape;
+			out.push(ch);
+		}
+		out
+	}
+
+	pub(crate) fn split_statements(sql: &str) -> Vec<String> {
+		let mut out = Vec::new();
+		let mut buf = String::new();
+		let mut in_single = false;
+		let mut in_double = false;
+		let mut in_backtick = false;
+		let mut prev_escape = false;
+		let mut brace_depth = 0usize;
+
+		for ch in sql.chars() {
+			match ch {
+				'\'' if !in_double && !in_backtick && !prev_escape => in_single = !in_single,
+				'"' if !in_single && !in_backtick && !prev_escape => in_double = !in_double,
+				'`' if !in_single && !in_double && !prev_escape => in_backtick = !in_backtick,
+				'{' if !in_single && !in_double && !in_backtick => brace_depth += 1,
+				'}' if !in_single && !in_double && !in_backtick && brace_depth > 0 => {
+					brace_depth -= 1
+				}
+				';' if !in_single && !in_double && !in_backtick && brace_depth == 0 => {
+					let stmt = buf.trim();
+					if !stmt.is_empty() {
+						out.push(stmt.to_string());
+					}
+					buf.clear();
+					prev_escape = false;
+					continue;
+				}
+				_ => {}
+			}
+
+			prev_escape = ch == '\\' && !prev_escape;
+			buf.push(ch);
+		}
+
+		let tail = buf.trim();
+		if !tail.is_empty() {
+			out.push(tail.to_string());
+		}
+
+		out
+	}
+
+	use std::str::FromStr;
+
+	use super::{CatalogEntity, EntityKind, normalize_statement};
+	use crate::core::sha256_hex;
+
+	/// The entities the old pipeline extracted from `sql`, with their statement
+	/// hashes, skipping anything it could not read (which the new pipeline is
+	/// allowed to read differently).
+	pub(crate) fn entities(sql: &str) -> Vec<CatalogEntity> {
+		let mut out = Vec::new();
+		for stmt in split_statements(&strip_comments(sql)) {
+			let normalized = stmt.trim();
+			if !normalized.to_ascii_uppercase().starts_with("DEFINE ") {
+				continue;
+			}
+			if let Some(mut entity) = parse_define_entity(normalized) {
+				entity.statement_hash = sha256_hex(normalize_statement(normalized).as_bytes());
+				out.push(entity);
+			}
+		}
+		out
+	}
+
+	fn parse_define_entity(stmt: &str) -> Option<CatalogEntity> {
+		let tokens = tokenize(stmt);
+		if tokens.len() < 3 || !eq(tokens[0], "DEFINE") {
+			return None;
+		}
+
+		let kind = EntityKind::from_str(tokens[1]).ok()?;
+		let mut idx = 2;
+		idx = skip_modifiers(&tokens, idx);
+		if idx >= tokens.len() {
+			return None;
+		}
+
+		let (scope, name) = match &kind {
+			EntityKind::Table => (None, clean_ident(tokens[idx])),
+			EntityKind::Field | EntityKind::Event | EntityKind::Index => {
+				let name = clean_ident(tokens[idx]);
+				let on_idx = find_token(&tokens, idx + 1, "ON")?;
+				let mut scope_idx = on_idx + 1;
+				if scope_idx < tokens.len() && eq(tokens[scope_idx], "TABLE") {
+					scope_idx += 1;
+				}
+				if scope_idx >= tokens.len() {
+					return None;
+				}
+				(Some(clean_ident(tokens[scope_idx])), name)
+			}
+			EntityKind::Function
+			| EntityKind::Param
+			| EntityKind::Analyzer
+			| EntityKind::Api
+			| EntityKind::Bucket
+			| EntityKind::Model
+			| EntityKind::Sequence
+			| EntityKind::Config
+			| EntityKind::Module => (None, clean_ident(tokens[idx])),
+			EntityKind::Access | EntityKind::User => {
+				let name = clean_ident(tokens[idx]);
+				let scope = find_token(&tokens, idx + 1, "ON").and_then(|on_idx| {
+					let i = on_idx + 1;
+					if i < tokens.len() {
+						Some(clean_ident(tokens[i]))
+					} else {
+						None
+					}
+				});
+				(scope, name)
+			}
+			_ => return None,
+		};
+
+		Some(CatalogEntity {
+			kind,
+			scope,
+			name,
+			source_path: String::new(),
+			statement_hash: String::new(),
+			file_hash: String::new(),
+		})
+	}
+
+	fn tokenize(stmt: &str) -> Vec<&str> {
+		stmt.split_whitespace().collect()
+	}
+
+	fn clean_ident(token: &str) -> String {
+		let trimmed = token.trim_matches(|c: char| {
+			c == ',' || c == ';' || c == '(' || c == ')' || c == '{' || c == '}'
+		});
+		let core = match trimmed.find('(') {
+			Some(pos) => &trimmed[..pos],
+			None => trimmed,
+		};
+		core.to_string()
+	}
+
+	fn skip_modifiers(tokens: &[&str], mut idx: usize) -> usize {
+		while idx < tokens.len()
+			&& (eq(tokens[idx], "OVERWRITE")
+				|| eq(tokens[idx], "IF")
+				|| eq(tokens[idx], "NOT")
+				|| eq(tokens[idx], "EXISTS"))
+		{
+			idx += 1;
+		}
+		idx
+	}
+
+	fn find_token(tokens: &[&str], start: usize, target: &str) -> Option<usize> {
+		(start..tokens.len()).find(|&i| eq(tokens[i], target))
+	}
+
+	fn eq(value: &str, expected: &str) -> bool {
+		value.eq_ignore_ascii_case(expected)
 	}
 }
 
 #[cfg(test)]
 mod tests {
+	use std::path::PathBuf;
+
 	use test_case::test_case;
 
 	use super::*;
+
+	fn prep(sql: &str) -> String {
+		prepare_schema_sql(sql).expect("prepare").sql
+	}
 
 	#[test]
 	fn entity_kind_serializes_to_lowercase_keyword() {
@@ -1071,14 +1739,21 @@ mod tests {
 		// idempotent. A `DEFINE MODULE mod::x AS f"..."` must gain OVERWRITE right
 		// after the MODULE keyword (where surrealdb's parser expects it), and an
 		// explicit IF NOT EXISTS must be rewritten to OVERWRITE.
-		let plain = ensure_overwrite("DEFINE MODULE mod::math AS f\"math:/math.surli\";");
+		let plain = prep("DEFINE MODULE mod::math AS f\"math:/math.surli\";");
 		assert_eq!(plain.trim(), "DEFINE MODULE OVERWRITE mod::math AS f\"math:/math.surli\";");
 
-		let if_not_exists =
-			ensure_overwrite("DEFINE MODULE IF NOT EXISTS mod::math AS f\"math:/math.surli\";");
+		let if_not_exists = prep("DEFINE MODULE IF NOT EXISTS mod::math AS f\"math:/math.surli\";");
 		assert_eq!(
 			if_not_exists.trim(),
 			"DEFINE MODULE OVERWRITE mod::math AS f\"math:/math.surli\";"
+		);
+
+		// SurrealDB 3.3 spells it `FROM ... UNSIGNED`; the modifier still goes
+		// straight after MODULE.
+		let v33 = prep("DEFINE MODULE mod::math FROM f\"math:/math.surli\" UNSIGNED;");
+		assert_eq!(
+			v33.trim(),
+			"DEFINE MODULE OVERWRITE mod::math FROM f\"math:/math.surli\" UNSIGNED;"
 		);
 	}
 
@@ -1255,7 +1930,7 @@ mod tests {
 		// ensure_overwrite must pass these through unchanged (no OVERWRITE injection).
 		let sql = "DEFINE TABLE person SCHEMAFULL;\n\
 		           INSERT INTO person (name) VALUES ('seed');";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(result.contains("DEFINE TABLE OVERWRITE person SCHEMAFULL;"));
 		assert!(result.contains("INSERT INTO person (name) VALUES ('seed');"));
 	}
@@ -1679,7 +2354,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_injects_when_missing() {
 		let sql = "DEFINE TABLE post SCHEMAFULL;\nDEFINE FIELD name ON post TYPE string;";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(result.contains("DEFINE TABLE OVERWRITE post SCHEMAFULL;"));
 		assert!(result.contains("DEFINE FIELD OVERWRITE name ON post TYPE string;"));
 	}
@@ -1687,7 +2362,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_preserves_existing() {
 		let sql = "DEFINE TABLE OVERWRITE post SCHEMAFULL;";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(result.contains("DEFINE TABLE OVERWRITE post SCHEMAFULL;"));
 		// Should not double up OVERWRITE
 		assert!(!result.contains("OVERWRITE OVERWRITE"));
@@ -1698,7 +2373,7 @@ mod tests {
 		// IF NOT EXISTS prevents schema changes from being applied in sync;
 		// ensure_overwrite must replace it with OVERWRITE so updates are not silently skipped.
 		let sql = "DEFINE TABLE IF NOT EXISTS post SCHEMAFULL;";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(result.contains("DEFINE TABLE OVERWRITE post SCHEMAFULL;"), "got: {result}");
 		assert!(!result.contains("IF NOT EXISTS"), "IF NOT EXISTS should be replaced: {result}");
 	}
@@ -1706,7 +2381,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_replaces_if_not_exists_field() {
 		let sql = "DEFINE FIELD IF NOT EXISTS email ON person TYPE string;";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(
 			result.contains("DEFINE FIELD OVERWRITE email ON person TYPE string;"),
 			"got: {result}"
@@ -1717,7 +2392,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_replaces_if_not_exists_event() {
 		let sql = "DEFINE EVENT IF NOT EXISTS changed ON person WHEN true THEN ();";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(
 			result.contains("DEFINE EVENT OVERWRITE changed ON person WHEN true THEN ();"),
 			"got: {result}"
@@ -1728,7 +2403,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_replaces_if_not_exists_index() {
 		let sql = "DEFINE INDEX IF NOT EXISTS by_email ON TABLE person FIELDS email;";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(
 			result.contains("DEFINE INDEX OVERWRITE by_email ON TABLE person FIELDS email;"),
 			"got: {result}"
@@ -1739,7 +2414,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_replaces_if_not_exists_function() {
 		let sql = "DEFINE FUNCTION IF NOT EXISTS fn::greet($name: string) { RETURN $name; };";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(!result.contains("IF NOT EXISTS"), "got: {result}");
 		assert!(result.contains("DEFINE FUNCTION OVERWRITE"), "got: {result}");
 	}
@@ -1747,7 +2422,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_replaces_if_not_exists_param() {
 		let sql = "DEFINE PARAM IF NOT EXISTS $env VALUE 'dev';";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(result.contains("DEFINE PARAM OVERWRITE $env VALUE 'dev';"), "got: {result}");
 		assert!(!result.contains("IF NOT EXISTS"), "got: {result}");
 	}
@@ -1755,7 +2430,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_replaces_if_not_exists_analyzer() {
 		let sql = "DEFINE ANALYZER IF NOT EXISTS english TOKENIZERS blank, class;";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(
 			result.contains("DEFINE ANALYZER OVERWRITE english TOKENIZERS blank, class;"),
 			"got: {result}"
@@ -1766,7 +2441,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_replaces_if_not_exists_access() {
 		let sql = "DEFINE ACCESS IF NOT EXISTS admin ON DATABASE TYPE RECORD;";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(!result.contains("IF NOT EXISTS"), "got: {result}");
 		assert!(result.contains("DEFINE ACCESS OVERWRITE"), "got: {result}");
 	}
@@ -1774,7 +2449,7 @@ mod tests {
 	#[test]
 	fn ensure_overwrite_replaces_if_not_exists_user() {
 		let sql = "DEFINE USER IF NOT EXISTS app ON DATABASE PASSHASH 'x';";
-		let result = ensure_overwrite(sql);
+		let result = prep(sql);
 		assert!(!result.contains("IF NOT EXISTS"), "got: {result}");
 		assert!(result.contains("DEFINE USER OVERWRITE"), "got: {result}");
 	}
@@ -1996,5 +2671,738 @@ mod tests {
 
 		let diff = diff_catalog(&old, &new);
 		assert_eq!(diff.modified.len(), 1, "modifier change should be a modification");
+	}
+
+	// --- Folder-relative tracking keys (BUG: cwd-relative keys diverged between a
+	// local checkout and a container, re-keying every tracked file).
+
+	#[test]
+	fn keys_are_relative_to_the_folder_not_the_working_directory() {
+		for folder in ["./database", "database", "/srv/database"] {
+			let path = PathBuf::from(folder).join("schema").join("user.surql");
+			assert_eq!(
+				folder_relative_key(folder, &path).expect("key"),
+				"schema/user.surql",
+				"folder {folder:?} produced a non-canonical key"
+			);
+		}
+	}
+
+	#[test]
+	fn module_keys_keep_their_module_path() {
+		let path = PathBuf::from("database/modules/billing/schema/001.surql");
+		assert_eq!(
+			folder_relative_key("database", &path).expect("key"),
+			"modules/billing/schema/001.surql"
+		);
+	}
+
+	#[test]
+	fn every_legacy_spelling_maps_onto_one_canonical_key() {
+		let canonical = "schema/user.surql";
+		for stored in [
+			"schema/user.surql",
+			"database/schema/user.surql",
+			"./database/schema/user.surql",
+			"/database/schema/user.surql",
+			"/home/runner/work/app/database/schema/user.surql",
+		] {
+			assert!(is_legacy_key_for(stored, canonical), "{stored:?} should match {canonical:?}");
+		}
+	}
+
+	#[test]
+	fn a_genuinely_different_file_is_not_treated_as_a_legacy_key() {
+		assert!(!is_legacy_key_for("schema/other.surql", "schema/user.surql"));
+		// A suffix that is not on a path-segment boundary must not match, or
+		// `admin_user.surql` would be mistaken for `user.surql`.
+		assert!(!is_legacy_key_for("schema/admin_user.surql", "schema/user.surql"));
+	}
+
+	#[test]
+	fn canonicalise_keys_migrates_legacy_and_keeps_genuinely_removed_files() {
+		let mut stored = BTreeMap::new();
+		stored.insert("/database/schema/user.surql".to_string(), "hash-a".to_string());
+		stored.insert("database/schema/post.surql".to_string(), "hash-b".to_string());
+		stored.insert("schema/deleted.surql".to_string(), "hash-c".to_string());
+
+		let canonical = ["schema/user.surql".to_string(), "schema/post.surql".to_string()];
+		let (migrated, re_keyed) = canonicalise_keys(&stored, &canonical);
+
+		assert_eq!(migrated.get("schema/user.surql"), Some(&"hash-a".to_string()));
+		assert_eq!(migrated.get("schema/post.surql"), Some(&"hash-b".to_string()));
+		// A file that really was deleted must survive as a stale key so prune sees it.
+		assert_eq!(migrated.get("schema/deleted.surql"), Some(&"hash-c".to_string()));
+		assert_eq!(re_keyed.len(), 2, "both legacy spellings should be re-keyed");
+	}
+
+	/// Both rows for one file, with a folder name that sorts after the canonical
+	/// key. The canonical row holds the current hash and must survive.
+	#[test]
+	fn canonicalise_keys_prefers_the_canonical_row_over_a_legacy_one() {
+		let mut stored = BTreeMap::new();
+		stored.insert("schema/a.surql".to_string(), "current".to_string());
+		stored.insert("zzz/schema/a.surql".to_string(), "stale".to_string());
+
+		let canonical = ["schema/a.surql".to_string()];
+		let (migrated, re_keyed) = canonicalise_keys(&stored, &canonical);
+
+		assert_eq!(
+			migrated.get("schema/a.surql"),
+			Some(&"current".to_string()),
+			"a stale legacy hash must not overwrite the canonical row"
+		);
+		assert_eq!(migrated.len(), 1, "the legacy row must not survive as a separate key");
+		assert_eq!(re_keyed.len(), 1, "the legacy row still needs retiring");
+	}
+
+	#[test]
+	fn strip_folder_prefix_handles_every_folder_spelling() {
+		for folder in ["database", "./database", "/database"] {
+			for stored in
+				["database/schema/a.surql", "./database/schema/a.surql", "/database/schema/a.surql"]
+			{
+				assert_eq!(
+					strip_folder_prefix(folder, stored),
+					"schema/a.surql",
+					"folder={folder:?} stored={stored:?}"
+				);
+			}
+		}
+		// Already canonical: left alone.
+		assert_eq!(strip_folder_prefix("database", "schema/a.surql"), "schema/a.surql");
+
+		// A key that is already canonical must be left alone, even when the folder
+		// name collides with its first segment.
+		assert_eq!(strip_folder_prefix("schema", "schema/a.surql"), "schema/a.surql");
+		// And an interior directory sharing the folder's name is not a prefix.
+		assert_eq!(
+			strip_folder_prefix("database", "schema/database/tables.surql"),
+			"schema/database/tables.surql"
+		);
+		// An unrecognised prefix is left intact rather than guessed at; the sync
+		// migration matches those on a path-segment boundary instead.
+		assert_eq!(
+			strip_folder_prefix("database", "/srv/app/database/schema/a.surql"),
+			"/srv/app/database/schema/a.surql"
+		);
+	}
+
+	/// The manifest-portability bug: a rollout planned from a repo root could not
+	/// be started in a container, because the hash covered the paths.
+	#[test]
+	fn the_schema_hash_no_longer_depends_on_where_the_command_ran() {
+		let files = |root: &str| {
+			vec![SchemaFile {
+				path: folder_relative_key(root, &PathBuf::from(root).join("schema/a.surql"))
+					.expect("key"),
+				sql: "DEFINE TABLE a SCHEMAFULL;".to_string(),
+				hash: "content-hash".to_string(),
+			}]
+		};
+
+		let local = hash_schema_snapshot(&snapshot_from_files(&files("./database"))).expect("hash");
+		let container =
+			hash_schema_snapshot(&snapshot_from_files(&files("/database"))).expect("hash");
+		assert_eq!(local, container, "the same schema must hash identically in any environment");
+	}
+
+	/// The case a real project hits: the manifest was planned inside a container
+	/// with `SURREALDB_FOLDER=/database`, so its keys carry `/database`, and the
+	/// developer's folder is somewhere else entirely. No amount of guessing from
+	/// the local folder string reaches that prefix, but the manifest records it in
+	/// its own `apply_files` paths.
+	#[test]
+	fn a_manifest_planned_elsewhere_verifies_from_its_recorded_paths() {
+		let snapshot = snapshot_from_files(&[SchemaFile {
+			path: "schema/014-sku.surql".to_string(),
+			sql: "DEFINE TABLE sku SCHEMAFULL;".to_string(),
+			hash: "content-hash".to_string(),
+		}]);
+
+		// What the container recorded when it planned.
+		let legacy = SchemaSnapshot {
+			version: snapshot.version,
+			files: vec![SchemaSnapshotEntry {
+				path: "/database/schema/014-sku.surql".to_string(),
+				hash: "content-hash".to_string(),
+			}],
+		};
+		let recorded = hash_schema_snapshot(&legacy).expect("legacy hash");
+
+		// Derived the way callers derive it: from the paths the manifest recorded.
+		let canonical = vec!["schema/014-sku.surql".to_string()];
+		let (key, prefix) =
+			canonicalise_recorded_path("/database/schema/014-sku.surql", &canonical)
+				.expect("the recorded path should map onto its canonical key");
+		assert_eq!(key, "schema/014-sku.surql");
+		assert_eq!(prefix, "/database");
+		let hints = vec![prefix];
+
+		// The local folder shares no prefix with the container's.
+		verify_schema_hash(
+			&snapshot,
+			"/home/dev/project/database",
+			&recorded,
+			"20260911194216__sku_on_hand",
+			&hints,
+		)
+		.expect("a manifest planned in another environment must still verify");
+
+		// Without the recorded paths there is nothing to derive the prefix from.
+		assert!(
+			verify_schema_hash(
+				&snapshot,
+				"/home/dev/project/database",
+				&recorded,
+				"20260911194216__sku_on_hand",
+				&[],
+			)
+			.is_err(),
+			"the hint is what makes this work; guard against it becoming a no-op"
+		);
+	}
+
+	#[test]
+	fn a_pre_beta2_manifest_hash_is_accepted_with_a_warning() {
+		let snapshot = snapshot_from_files(&[SchemaFile {
+			path: "schema/a.surql".to_string(),
+			sql: "DEFINE TABLE a SCHEMAFULL;".to_string(),
+			hash: "content-hash".to_string(),
+		}]);
+
+		let legacy = legacy_schema_hashes(&snapshot, "./database", &[]).expect("legacy hashes");
+		assert!(!legacy.is_empty(), "expected at least one legacy spelling");
+
+		// Every legacy spelling the old code could have recorded must still verify.
+		for recorded in &legacy {
+			verify_schema_hash(&snapshot, "./database", recorded, "20260101000000__demo", &[])
+				.expect("a pre-beta2 manifest must still start");
+		}
+
+		// A genuinely different schema must still be rejected.
+		let err =
+			verify_schema_hash(&snapshot, "./database", "deadbeef", "20260101000000__demo", &[])
+				.expect_err("a real mismatch must fail");
+		assert!(err.to_string().contains("target schema hash mismatch"), "got: {err}");
+	}
+
+	// ---- surql_scan migration -------------------------------------------------
+
+	/// Every `.surql` file in the repository, outside build output.
+	fn repo_corpus() -> Vec<(String, String)> {
+		let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+		let mut out: Vec<(String, String)> = WalkDir::new(&root)
+			.into_iter()
+			.filter_entry(|entry| {
+				let name = entry.file_name().to_string_lossy();
+				!matches!(name.as_ref(), "target" | ".claude" | "node_modules" | ".git")
+			})
+			.filter_map(Result::ok)
+			.filter(|entry| entry.path().extension().is_some_and(|ext| ext == "surql"))
+			.map(|entry| {
+				let path = entry.path().strip_prefix(&root).unwrap().display().to_string();
+				(path, fs::read_to_string(entry.path()).unwrap())
+			})
+			.collect();
+		out.sort();
+		assert!(out.len() >= 20, "corpus went missing: {} files", out.len());
+		out
+	}
+
+	/// Statements the old splitter read correctly, taken from this module's tests.
+	const LEGACY_VECTORS: &[&str] = &[
+		"DEFINE TABLE person SCHEMAFULL;\nDEFINE FIELD name ON TABLE person TYPE string;",
+		"DEFINE FIELD a.b[*] ON t TYPE string;\nDEFINE FIELD emails.*.address ON user TYPE string;",
+		"DEFINE FUNCTION fn::greet($n: string) { RETURN 'hi ' + $n; };\nDEFINE FUNCTION fn::two ($a: int) { RETURN $a; };",
+		"DEFINE INDEX by_email ON TABLE person FIELDS email UNIQUE;\nDEFINE EVENT changed ON person WHEN true THEN { CREATE log; };",
+		"DEFINE ACCESS account ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM user WHERE email = $email) DURATION FOR TOKEN 1h;",
+		"DEFINE USER admin ON ROOT PASSWORD 'secret' ROLES OWNER;\nDEFINE PARAM $env VALUE 'dev';",
+		"DEFINE ANALYZER english TOKENIZERS blank, class FILTERS lowercase;\nDEFINE SEQUENCE order_no BATCH 10 START 100;",
+		"DEFINE API \"/users/:id\" FOR get THEN { RETURN 1; };\nDEFINE BUCKET files BACKEND \"memory\";",
+		"DEFINE MODEL ml::sentiment<1.0.0>;\nDEFINE CONFIG GRAPHQL AUTO;\nDEFINE MODULE mod::math AS f\"math:/math.surli\";",
+		"DEFINE TABLE IF NOT EXISTS a;\nDEFINE TABLE OVERWRITE b;\ndefine table c schemaless;",
+		"-- c\nDEFINE TABLE a SCHEMAFULL; -- trailing\n// x\nDEFINE FIELD f ON a TYPE string; # hash\n/* block\n */ DEFINE TABLE b;",
+		"DEFINE FIELD a ON foo TYPE string DEFAULT 'it\\'s -- still in string';\nDEFINE FIELD b ON foo DEFAULT \"/* not */\";",
+		"DEFINE TABLE ${PREFIX}_users;\nDEFINE FIELD x ON ${PREFIX}_users TYPE string;",
+		"DEFINE FIELD f ON t TYPE int VALUE $value - 1;\nDEFINE FIELD g ON t TYPE int VALUE 4 / 2;",
+	];
+
+	fn keys_and_hashes(entities: &[CatalogEntity]) -> Vec<(EntityKey, String)> {
+		entities.iter().map(|e| (e.key(), e.statement_hash.clone())).collect()
+	}
+
+	#[test]
+	fn entity_keys_and_hashes_match_the_old_pipeline() {
+		// A changed key reads as a removed entity and a new one, and sync prunes the
+		// "removed" one: REMOVE TABLE. So on everything the old splitter read
+		// correctly, the new one must agree byte for byte.
+		let mut corpus = repo_corpus();
+		corpus.extend(
+			LEGACY_VECTORS
+				.iter()
+				.enumerate()
+				.map(|(i, sql)| (format!("vector {i}"), sql.to_string())),
+		);
+		for (path, sql) in corpus {
+			let file = SchemaFile {
+				path: path.clone(),
+				hash: "h".to_string(),
+				sql: sql.clone(),
+			};
+			let (entities, _) = parse_schema_statements(&file, true)
+				.unwrap_or_else(|err| panic!("{path} no longer parses: {err:#}"));
+			assert_eq!(
+				keys_and_hashes(&entities),
+				keys_and_hashes(&legacy::entities(&sql)),
+				"entity keys or hashes changed for {path}"
+			);
+		}
+	}
+
+	/// Valid SurrealDB 3.3 schema that the old splitter could not read.
+	const TRICKY_SCHEMA: &str = "-- a file that exercises every lexical trap
+DEFINE PARAM OVERWRITE $PRE_FILTER VALUE /[ \\-_().,\\\\\\/$&+,:;=?@#|'<>^*%!]/;
+DEFINE FUNCTION OVERWRITE fn::preFilter($str: option<string>) {
+	RETURN IF $str {
+		string::replace($str, $PRE_FILTER, '')
+	};
+};
+DEFINE TABLE person SCHEMAFULL; # it's a comment
+DEFINE FIELD name ON person TYPE string ASSERT $value = /^[a-z#';{]+$/;
+DEFINE FIELD half ON person TYPE option<number> VALUE 10 / 2;
+DEFINE FIELD note ON person TYPE option<string> DEFAULT 'it\\'s -- not a comment # nor this; or this';
+DEFINE FIELD tag ON person TYPE option<string> DEFAULT ALWAYS \"a;b\";
+DEFINE FUNCTION fn::braces($s: string) {
+	LET $x = { a: 1 };
+	IF $s = /}/ { RETURN '{'; };
+	RETURN $s;
+};
+DEFINE TABLE `odd;name#` SCHEMALESS;
+DEFINE TABLE ⟨other;name⟩ SCHEMALESS;
+DEFINE PARAM $rid VALUE person:⟨a;b⟩;
+DEFINE PARAM $list VALUE [/a'/, /b#/, { re: /c;/ }];
+DEFINE PARAM $re2 VALUE <regex> \"a;b#c\";
+DEFINE PARAM $half VALUE 10 / 2;
+DEFINE SEQUENCE seq BATCH 1 START 1;
+DEFINE INDEX by_name ON person FIELDS name;
+DEFINE ANALYZER simple TOKENIZERS blank, class FILTERS lowercase;
+DEFINE EVENT ev ON person WHEN $event = 'CREATE' THEN {
+	LET $re = /x;y'/;
+	RETURN $re;
+};
+DEFINE ACCESS acc ON DATABASE TYPE RECORD
+	SIGNIN (SELECT * FROM person WHERE name = $name)
+	WITH JWT ALGORITHM HS512 KEY 'secret;#--';
+/* a closing comment with a ' quote */
+";
+
+	async fn mem_db() -> surrealdb::Surreal<surrealdb::engine::any::Any> {
+		crate::test_db::fresh("scan").await
+	}
+
+	async fn schema_info(db: &surrealdb::Surreal<surrealdb::engine::any::Any>) -> String {
+		use surrealdb_types::SurrealValue;
+		let mut res = db.query("INFO FOR DB").await.unwrap().check().unwrap();
+		let info: surrealdb_types::Value = res.take(0).unwrap();
+		let info = serde_json::Value::from_value(info).unwrap();
+		let mut out = vec![info.to_string()];
+		let tables: Vec<String> =
+			info["tables"].as_object().map(|t| t.keys().cloned().collect()).unwrap_or_default();
+		for table in tables {
+			let mut res = db
+				.query("INFO FOR TABLE $t")
+				.bind(("t", table.clone()))
+				.await
+				.unwrap()
+				.check()
+				.unwrap();
+			let info: surrealdb_types::Value = res.take(0).unwrap();
+			out.push(format!("{table}: {}", serde_json::Value::from_value(info).unwrap()));
+		}
+		out.join("\n")
+	}
+
+	/// SurrealDB is the oracle. For each file: its own statement count matches
+	/// ours, applying our statements one at a time defines exactly what applying
+	/// the file does, and the prepared form applies twice without error and
+	/// defines the same schema again.
+	#[tokio::test]
+	async fn splitting_and_preparing_agree_with_surrealdb() {
+		let mut corpus: Vec<(String, String)> = repo_corpus()
+			.into_iter()
+			.filter(|(path, _)| {
+				path.contains("/schema/")
+					|| path.contains("embed_schema")
+					|| path.contains("embed_modules")
+			})
+			.collect();
+		corpus.push(("tricky".to_string(), TRICKY_SCHEMA.to_string()));
+		corpus.push(("crlf".to_string(), TRICKY_SCHEMA.replace('\n', "\r\n")));
+		for (path, sql) in corpus {
+			let statements =
+				crate::surql_scan::scan(&sql).unwrap_or_else(|err| panic!("{path}: {err}"));
+
+			let whole = mem_db().await;
+			let response =
+				whole.query(sql.as_str()).await.unwrap_or_else(|err| panic!("{path}: {err}"));
+			assert_eq!(
+				response.num_statements(),
+				statements.len(),
+				"{path}: statement count differs from SurrealDB's"
+			);
+			response.check().unwrap_or_else(|err| panic!("{path}: {err}"));
+
+			let split = mem_db().await;
+			for stmt in &statements {
+				split.query(stmt.text(&sql)).await.and_then(|r| r.check()).unwrap_or_else(|err| {
+					panic!("{path} line {}: {err}\n{}", stmt.line, stmt.text(&sql))
+				});
+			}
+
+			let prepared = prepare_schema_sql(&sql).unwrap();
+			assert_eq!(prepared.statements, statements.len());
+			let reapplied = mem_db().await;
+			for round in 0..2 {
+				reapplied
+					.query(prepared.sql.as_str())
+					.await
+					.and_then(|r| r.check())
+					.unwrap_or_else(|err| {
+						panic!("{path}: prepared apply {round} failed: {err}\n{}", prepared.sql)
+					});
+			}
+
+			let expected = schema_info(&whole).await;
+			assert_eq!(
+				schema_info(&split).await,
+				expected,
+				"{path}: split statements define a different schema"
+			);
+			assert_eq!(
+				schema_info(&reapplied).await,
+				expected,
+				"{path}: prepared statements define a different schema"
+			);
+		}
+	}
+
+	#[test]
+	fn issue_92_file_parses_into_its_two_entities() {
+		let sql = TRICKY_SCHEMA.split("DEFINE TABLE person").next().unwrap();
+		let file = SchemaFile {
+			path: "schema/utils.surql".to_string(),
+			hash: "h".to_string(),
+			sql: sql.to_string(),
+		};
+		let (entities, _) = parse_schema_statements(&file, false).expect("the #92 file must parse");
+		let names: Vec<&str> = entities.iter().map(|e| e.name.as_str()).collect();
+		assert_eq!(names, vec!["$PRE_FILTER", "fn::preFilter"]);
+	}
+
+	#[test]
+	fn the_whole_tricky_schema_is_catalogued() {
+		let file = SchemaFile {
+			path: "schema/tricky.surql".to_string(),
+			hash: "h".to_string(),
+			sql: TRICKY_SCHEMA.to_string(),
+		};
+		let (entities, _) = parse_schema_statements(&file, false).unwrap();
+		let keys: Vec<String> = entities
+			.iter()
+			.map(|e| format!("{}:{}:{}", e.kind, e.scope.as_deref().unwrap_or("-"), e.name))
+			.collect();
+		assert_eq!(
+			keys,
+			vec![
+				"param:-:$PRE_FILTER",
+				"function:-:fn::preFilter",
+				"table:-:person",
+				"field:person:name",
+				"field:person:half",
+				"field:person:note",
+				"field:person:tag",
+				"function:-:fn::braces",
+				"table:-:`odd;name#`",
+				"table:-:⟨other;name⟩",
+				"param:-:$rid",
+				"param:-:$list",
+				"param:-:$re2",
+				"param:-:$half",
+				"sequence:-:seq",
+				"index:person:by_name",
+				"analyzer:-:simple",
+				"event:person:ev",
+				"access:DATABASE:acc",
+			]
+		);
+	}
+
+	#[test_case("DEFINE\n  TABLE\tperson;", "person" ; "newline and tab after define")]
+	#[test_case("DEFINE /* c */ TABLE person;", "person" ; "comment after define")]
+	#[test_case("DEFINE TABLE IF  NOT\n EXISTS person;", "person" ; "spaced if not exists")]
+	#[test_case("DEFINE TABLE overwrite_log;", "overwrite_log" ; "name starting with overwrite")]
+	#[test_case("DEFINE TABLE `my table`;", "`my table`" ; "backtick name with a space")]
+	#[test_case("DEFINE TABLE ⟨my table⟩;", "⟨my table⟩" ; "angle name with a space")]
+	fn names_the_old_whitespace_split_got_wrong(sql: &str, name: &str) {
+		let file = SchemaFile {
+			path: "schema/x.surql".to_string(),
+			hash: "h".to_string(),
+			sql: sql.to_string(),
+		};
+		let (entities, _) = parse_schema_statements(&file, false).unwrap();
+		assert_eq!(entities.len(), 1);
+		assert_eq!(entities[0].name, name);
+	}
+
+	#[test]
+	fn a_lost_statement_boundary_is_an_error_naming_the_file_and_line() {
+		let file = SchemaFile {
+			path: "schema/glued.surql".to_string(),
+			hash: "h".to_string(),
+			sql: "DEFINE TABLE a;\nDEFINE PARAM $x VALUE 'oops;\nDEFINE TABLE b;".to_string(),
+		};
+		let err = parse_schema_statements(&file, false).unwrap_err().to_string();
+		assert!(err.contains("schema file 'schema/glued.surql'"), "{err}");
+		assert!(err.contains("line 2, column 23"), "{err}");
+		assert!(err.contains("string is never closed"), "{err}");
+
+		let file = SchemaFile {
+			sql: "DEFINE TABLE a\nDEFINE TABLE b;".to_string(),
+			..file
+		};
+		let err = parse_schema_statements(&file, false).unwrap_err().to_string();
+		assert!(err.contains("line 2, column 1"), "{err}");
+		assert!(err.contains("began on line 1"), "{err}");
+	}
+
+	#[test]
+	fn a_non_define_statement_error_names_its_line() {
+		let file = SchemaFile {
+			path: "schema/x.surql".to_string(),
+			hash: "h".to_string(),
+			sql: "DEFINE TABLE a;\n\nCREATE a;".to_string(),
+		};
+		let err = parse_schema_statements(&file, false).unwrap_err().to_string();
+		assert!(err.contains("non-DEFINE statement at line 3"), "{err}");
+	}
+
+	#[test]
+	fn truncation_respects_character_boundaries() {
+		let long = format!("{}⟨x⟩ and more text after it", "a".repeat(95));
+		assert!(truncate_stmt(&long).ends_with("..."));
+		assert_eq!(truncate_stmt("short"), "short");
+	}
+
+	// ---- prepare_schema_sql ---------------------------------------------------
+
+	fn prepare(sql: &str) -> PreparedSql {
+		prepare_schema_sql(sql).expect("prepare")
+	}
+
+	#[test_case("DEFINE SEQUENCE s BATCH 1 START 1;", "DEFINE SEQUENCE IF NOT EXISTS s BATCH 1 START 1;" ; "plain gets if not exists")]
+	#[test_case("DEFINE SEQUENCE IF NOT EXISTS s;", "DEFINE SEQUENCE IF NOT EXISTS s;" ; "if not exists is kept")]
+	#[test_case("define sequence s;", "define sequence IF NOT EXISTS s;" ; "lowercase")]
+	#[test_case("DEFINE SEQUENCE overwrite_seq;", "DEFINE SEQUENCE IF NOT EXISTS overwrite_seq;" ; "name starting with overwrite")]
+	#[test_case("DEFINE\n\tSEQUENCE s;", "DEFINE\n\tSEQUENCE IF NOT EXISTS s;" ; "whitespace kept")]
+	fn sequences_are_never_overwritten_implicitly(sql: &str, expected: &str) {
+		let prepared = prepare(sql);
+		assert_eq!(prepared.sql.trim(), expected);
+		assert!(prepared.warnings.is_empty(), "{:?}", prepared.warnings);
+	}
+
+	#[test]
+	fn an_explicit_sequence_overwrite_is_kept_and_warned_about() {
+		let prepared = prepare("DEFINE TABLE t;\nDEFINE SEQUENCE Overwrite s START 500;");
+		assert!(
+			prepared.sql.contains("DEFINE SEQUENCE Overwrite s START 500;"),
+			"{}",
+			prepared.sql
+		);
+		assert_eq!(
+			prepared.warnings,
+			vec![PrepareWarning::SequenceOverwrite {
+				name: "s".to_string(),
+				line: 2,
+			}]
+		);
+		let message = prepared.warnings[0].to_string();
+		assert!(message.contains("sequence `s`") && message.contains("line 2"), "{message}");
+	}
+
+	#[test_case("DEFINE TABLE overwrite_log;", "DEFINE TABLE OVERWRITE overwrite_log;" ; "name starting with overwrite")]
+	#[test_case("DEFINE TABLE IF  NOT\n EXISTS t;", "DEFINE TABLE OVERWRITE t;" ; "spaced if not exists")]
+	#[test_case("DEFINE\n  TABLE t;", "DEFINE\n  TABLE OVERWRITE t;" ; "newline before kind")]
+	#[test_case("DEFINE /* c */ TABLE t;", "DEFINE /* c */ TABLE OVERWRITE t;" ; "comment before kind")]
+	#[test_case("define table if not exists t;", "define table OVERWRITE t;" ; "lowercase")]
+	fn other_kinds_get_overwrite_however_they_are_written(sql: &str, expected: &str) {
+		assert_eq!(prepare(sql).sql.trim(), expected);
+	}
+
+	#[test]
+	fn content_reaches_the_server_exactly_as_written() {
+		let prepared = prepare(TRICKY_SCHEMA);
+		assert!(
+			prepared.sql.contains("VALUE /[ \\-_().,\\\\\\/$&+,:;=?@#|'<>^*%!]/;"),
+			"{}",
+			prepared.sql
+		);
+		assert!(prepared.sql.contains("DEFINE TABLE OVERWRITE person SCHEMAFULL;"));
+		assert!(prepared.sql.contains("ASSERT $value = /^[a-z#';{]+$/;"));
+		assert!(prepared.sql.contains("DEFINE SEQUENCE IF NOT EXISTS seq BATCH 1 START 1;"));
+		assert!(prepared.sql.contains("LET $re = /x;y'/;"));
+	}
+
+	#[test]
+	fn inner_comments_are_kept_and_outer_ones_dropped() {
+		let prepared = prepare("-- lead\nDEFINE TABLE t -- why\n  SCHEMAFULL; # after\n");
+		assert_eq!(prepared.sql, "DEFINE TABLE OVERWRITE t -- why\n  SCHEMAFULL;\n");
+	}
+
+	#[test]
+	fn preparing_is_idempotent() {
+		for sql in [TRICKY_SCHEMA, "DEFINE SEQUENCE s; DEFINE TABLE t; CREATE t;"] {
+			let once = prepare(sql);
+			assert_eq!(prepare(&once.sql).sql, once.sql);
+		}
+	}
+
+	#[test]
+	fn non_define_statements_pass_through_and_are_counted() {
+		let prepared = prepare("LET $x = 1; CREATE t SET a = /x;/; DEFINE TABLE t;");
+		assert_eq!(prepared.statements, 3);
+		assert_eq!(
+			prepared.sql,
+			"LET $x = 1;\nCREATE t SET a = /x;/;\nDEFINE TABLE OVERWRITE t;\n"
+		);
+	}
+
+	#[test]
+	fn unreadable_sql_is_an_error_with_a_line() {
+		let err = prepare_schema_sql("DEFINE TABLE a;\nDEFINE TABLE b);").unwrap_err().to_string();
+		assert!(err.contains("line 2"), "{err}");
+	}
+
+	#[test_case("DEFINE ACCESS a ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM u);", true ; "keyless record")]
+	#[test_case("DEFINE ACCESS IF NOT EXISTS a ON DATABASE TYPE RECORD;", true ; "keyless record if not exists")]
+	#[test_case("DEFINE ACCESS a ON DATABASE TYPE BEARER FOR RECORD;", true ; "keyless bearer for record")]
+	#[test_case("DEFINE ACCESS a ON DATABASE TYPE RECORD WITH JWT ALGORITHM HS512 KEY 'k';", false ; "keyed record")]
+	#[test_case("DEFINE ACCESS a ON DATABASE TYPE RECORD WITH JWT URL 'https://x/jwks.json';", false ; "jwks record")]
+	#[test_case("DEFINE ACCESS a ON DATABASE TYPE JWT ALGORITHM HS512 KEY 'k';", false ; "jwt access")]
+	#[test_case("DEFINE TABLE record;", false ; "not an access")]
+	fn keyless_record_access_is_warned_about(sql: &str, warns: bool) {
+		let warnings = prepare(sql).warnings;
+		assert_eq!(
+			warnings.iter().any(
+				|w| matches!(w, PrepareWarning::KeylessRecordAccess { name, .. } if name == "a")
+			),
+			warns,
+			"{warnings:?}"
+		);
+	}
+
+	#[test]
+	fn overwrite_sequences_finds_only_explicit_overwrites() {
+		let files = vec![SchemaFile {
+			path: "schema/s.surql".to_string(),
+			hash: "h".to_string(),
+			sql: "DEFINE SEQUENCE a; DEFINE SEQUENCE OVERWRITE b; DEFINE SEQUENCE IF NOT EXISTS c; DEFINE TABLE OVERWRITE d;".to_string(),
+		}];
+		assert_eq!(overwrite_sequences(&files), BTreeSet::from(["b".to_string()]));
+	}
+
+	#[test]
+	#[expect(deprecated)]
+	fn ensure_overwrite_still_works_and_passes_unreadable_sql_through() {
+		assert_eq!(ensure_overwrite("DEFINE TABLE t;"), "DEFINE TABLE OVERWRITE t;\n");
+		assert_eq!(ensure_overwrite("DEFINE TABLE t);"), "DEFINE TABLE t);");
+	}
+
+	#[test]
+	fn a_schema_directory_enclosing_the_project_skips_frozen_rollout_files() {
+		let tmp = tempfile::TempDir::new().unwrap();
+		let folder = tmp.path().join("database");
+		fs::create_dir_all(folder.join("schema")).unwrap();
+		fs::create_dir_all(folder.join("rollouts/20260101000000__x/schema")).unwrap();
+		fs::write(folder.join("schema/live.surql"), "DEFINE TABLE live;").unwrap();
+		fs::write(folder.join("rollouts/20260101000000__x/schema/old.surql"), "DEFINE TABLE old;")
+			.unwrap();
+		let folder = folder.to_string_lossy().into_owned();
+		let files = collect_schema_files_at(&folder, Path::new(&folder)).unwrap();
+		let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+		assert_eq!(paths, vec!["schema/live.surql"]);
+		// The default layout never looks there in the first place.
+		assert_eq!(collect_schema_files(&folder).unwrap().len(), 1);
+	}
+
+	fn table(name: &str, scope: Option<&str>, kind: EntityKind) -> CatalogEntity {
+		CatalogEntity {
+			kind,
+			scope: scope.map(str::to_string),
+			name: name.to_string(),
+			source_path: "schema/q.surql".to_string(),
+			statement_hash: "h".to_string(),
+			file_hash: "f".to_string(),
+		}
+	}
+
+	#[test]
+	fn garbled_names_from_older_releases_are_repaired_or_dropped() {
+		let desired = vec![
+			table("`my table`", None, EntityKind::Table),
+			table("name", Some("`my table`"), EntityKind::Field),
+			table("⟨other one⟩", None, EntityKind::Table),
+			table("plain", None, EntityKind::Table),
+		];
+		let mut recorded = vec![
+			table("`my", None, EntityKind::Table),
+			table("name", Some("`my"), EntityKind::Field),
+			table("⟨other", None, EntityKind::Table),
+			table("`gone", None, EntityKind::Table),
+			table("plain", None, EntityKind::Table),
+		];
+		let repaired = reconcile_garbled(&mut recorded, &desired, Unmatched::Drop);
+		let names: Vec<(String, Option<String>)> =
+			recorded.iter().map(|e| (e.name.clone(), e.scope.clone())).collect();
+		assert_eq!(
+			names,
+			vec![
+				("name".to_string(), Some("`my table`".to_string())),
+				("`my table`".to_string(), None),
+				("plain".to_string(), None),
+				("⟨other one⟩".to_string(), None),
+			]
+		);
+		assert_eq!(repaired.len(), 4, "{repaired:?}");
+		// The statement hash and paths carry over: the entity did not change.
+		assert!(recorded.iter().all(|e| e.statement_hash == "h"));
+	}
+
+	#[test]
+	fn ordinary_names_are_never_touched() {
+		let names = [
+			"person",
+			"fn::greet",
+			"a.b[*]",
+			"$x",
+			"\"/users/:id\"",
+			"ml::m<1.0.0>",
+			"`odd;name#`",
+		];
+		let mut recorded: Vec<CatalogEntity> =
+			names.iter().map(|n| table(n, None, EntityKind::Table)).collect();
+		assert!(reconcile_garbled(&mut recorded, &[], Unmatched::Drop).is_empty());
+		assert_eq!(recorded.len(), names.len());
+	}
+
+	#[test]
+	fn a_partial_view_keeps_what_it_cannot_match() {
+		let mut recorded =
+			vec![table("`my", None, EntityKind::Table), table("`other", None, EntityKind::Table)];
+		let desired = vec![table("`my table`", None, EntityKind::Table)];
+		let repaired = reconcile_garbled(&mut recorded, &desired, Unmatched::Keep);
+		assert_eq!(repaired.len(), 1);
+		let names: Vec<&str> = recorded.iter().map(|e| e.name.as_str()).collect();
+		assert_eq!(names, vec!["`my table`", "`other"]);
 	}
 }

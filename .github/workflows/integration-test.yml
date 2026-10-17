@@ -1,22 +1,27 @@
 name: Integration Test
 
+# The path filters used to cover only the tester and config.rs, so no change to
+# rollout.rs, main.rs, schema_state.rs or sync.rs ever ran this workflow. That is
+# the structural reason a rollout CLI regression shipped in 1.0.0-beta.1: the
+# rollout id was parsed as a --target name and every rollout subcommand failed
+# before connecting, with nothing in CI to catch it.
+#
+# Branches are tested through their pull request; pushes run only on main, so a
+# commit on a PR branch does not run this twice.
 on:
     push:
-        paths:
+        branches:
+            - main
+        paths: &integration_paths
             - "Cargo.toml"
             - "examples/testing/**"
-            - "crates/surrealkit/src/tester/**"
-            - "crates/surrealkit/src/config.rs"
-            - "crates/surrealkit/tests/auth_levels.rs"
+            - "examples/rollout-testing/**"
+            - "examples/rollout-repro/**"
+            - "crates/surrealkit/src/**"
+            - "crates/surrealkit/tests/**"
             - ".github/workflows/integration-test.yml"
     pull_request:
-        paths:
-            - "Cargo.toml"
-            - "examples/testing/**"
-            - "crates/surrealkit/src/tester/**"
-            - "crates/surrealkit/src/config.rs"
-            - "crates/surrealkit/tests/auth_levels.rs"
-            - ".github/workflows/integration-test.yml"
+        paths: *integration_paths
     workflow_dispatch:
 
 permissions:
@@ -24,9 +29,15 @@ permissions:
 
 jobs:
     integration_test:
-        name: Surrealkit integration tests
+        name: Surrealkit integration tests (SurrealDB ${{ matrix.surrealdb }})
         runs-on: ubuntu-22.04
         timeout-minutes: 15
+        strategy:
+            fail-fast: false
+            matrix:
+                # The previous minor's latest patch and the current minor. 3.3
+                # tightened auth handling, which is exactly what these suites hit.
+                surrealdb: ["v3.2.4", "v3.3.0"]
         env:
             SURREALKIT_TEST_BASE_URL: http://127.0.0.1:8000
             SURREALDB_FOLDER: ${{ github.workspace }}/database
@@ -38,10 +49,17 @@ jobs:
             # Without this, tests/auth_levels.rs prints SKIP and passes, so the
             # namespace- and database-level signin paths were never exercised.
             SURREALKIT_AUTH_TEST_URL: ws://127.0.0.1:8000
+            # Points the library's own tests at this server instead of the
+            # embedded engine, which is always the SDK's version (3.3). SurrealQL
+            # differs between minors: 3.2 refuses an ORDER BY on a field a query
+            # does not select, and only a 3.2 server shows that.
+            SURREALKIT_TEST_URL: ws://127.0.0.1:8000
+            SURREALKIT_TEST_USER: root
+            SURREALKIT_TEST_PASS: secret
 
         services:
             surrealdb:
-                image: surrealdb/surrealdb:v3.2.0
+                image: surrealdb/surrealdb:${{ matrix.surrealdb }}
                 command: start --user root --pass secret memory
                 ports:
                     - 8000:8000
@@ -72,7 +90,7 @@ jobs:
             - name: Install Rust toolchain
               uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
               with:
-                  toolchain: 1.94.0
+                  toolchain: 1.95.0
 
             - name: Build surrealkit (debug)
               env:
@@ -132,10 +150,307 @@ jobs:
                     --features cli \
                     --locked
 
+            # The same suites against a schema built by replaying the rollouts, and
+            # the parity check between that and sync.
+            - name: Run the rollout-testing suites (sync and replayed rollouts)
+              run: ./target/debug/surrealkit --folder examples/rollout-testing/database test
+
+            - name: Lint the rollout-testing chain
+              run: ./target/debug/surrealkit --folder examples/rollout-testing/database rollout lint
+
+            # Library unit tests, rollout catch-up and the tester's live cases, on
+            # this server rather than the embedded engine.
+            - name: Library and rollout tests against this server
+              run: |
+                cargo test \
+                    --manifest-path crates/surrealkit/Cargo.toml \
+                    --lib --test rollout_catchup --test tester_live \
+                    --no-default-features \
+                    --features cli \
+                    --locked
+
             - name: Upload integration test report
               if: always()
               uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
               with:
-                  name: integration-test-report
+                  name: integration-test-report-${{ matrix.surrealdb }}
                   path: database/tests/report.json
                   if-no-files-found: warn
+
+    # End-to-end rollout coverage. Nothing exercised the rollout lifecycle against
+    # a live server before, and nothing exercised the CLI surface at all, which is
+    # how the 1.0.0-beta.1 arg-id regression and the resume bug fixed in #79 both
+    # shipped untested.
+    rollout_e2e:
+        name: Rollout lifecycle (SurrealDB ${{ matrix.surrealdb }})
+        runs-on: ubuntu-22.04
+        timeout-minutes: 20
+        strategy:
+            fail-fast: false
+            matrix:
+                # The minimum supported server, the previous minor's latest patch,
+                # and the current minor (the embedded engine's version).
+                surrealdb: ["v3.2.0", "v3.2.4", "v3.3.0"]
+        env:
+            SURREALDB_HOST: ws://127.0.0.1:8000
+            SURREALDB_NAME: rollout_db
+            SURREALDB_NAMESPACE: rollout_ns
+            SURREALDB_USER: root
+            SURREALDB_PASSWORD: secret
+        services:
+            surrealdb:
+                image: surrealdb/surrealdb:${{ matrix.surrealdb }}
+                command: start --user root --pass secret memory
+                ports:
+                    - 8000:8000
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.95.0
+
+            - name: Build surrealkit (debug)
+              env:
+                  CARGO_INCREMENTAL: 0
+                  RUSTFLAGS: "-C debuginfo=0"
+              run: |
+                cargo build \
+                    --manifest-path crates/surrealkit/Cargo.toml \
+                    --bin surrealkit \
+                    --no-default-features \
+                    --features cli \
+                    --locked
+
+            - name: Wait for SurrealDB
+              run: |
+                set -euo pipefail
+                for _ in $(seq 1 30); do
+                    if curl -sS -o /dev/null -X POST http://127.0.0.1:8000/signin \
+                        -H 'Content-Type: application/json' \
+                        -d '{"user":"root","pass":"secret"}'; then
+                        exit 0
+                    fi
+                    sleep 1
+                done
+                echo "SurrealDB never became ready"; exit 1
+
+            - name: Happy path — baseline, plan, lint, start, status, complete
+              run: examples/rollout-repro/scenarios/ci_lifecycle.sh
+
+            - name: Modified entity — plan refuses, --allow-modified plans, rollback restores
+              run: examples/rollout-repro/scenarios/ci_modified_entity.sh
+
+            - name: Resume — start, kill, start again (regression for #79)
+              run: examples/rollout-repro/scenarios/ci_resume.sh
+
+            - name: Container path keys — working_dir is not /
+              run: examples/rollout-repro/scenarios/ci_container_keys.sh
+
+            # `complete` used to delete the whole entity catalog and then recreate
+            # it in a second transaction. When that failed, the catalog stayed
+            # empty and `repair` failed the same way.
+            - name: Large catalog — complete writes the diff, repair rebuilds a wiped catalog
+              run: examples/rollout-repro/scenarios/ci_large_catalog.sh
+
+            # The upgrade path for a project that was synced from both a local
+            # checkout and a container, so `__entity` holds two spellings of every
+            # file. If the suffix match fails here every tracked key looks removed
+            # and the prune drops the live schema, so this is the one migration
+            # test that must never be allowed to rot.
+            - name: Key migration — two legacy spellings collapse without pruning
+              run: examples/rollout-repro/scenarios/ci_key_migration.sh
+
+            # #91: a database several releases behind runs every rollout it
+            # missed, in order, each applying what was planned.
+            - name: Catch-up — rollout up across three frozen rollouts
+              run: examples/rollout-repro/scenarios/ci_catchup.sh
+
+            # #92: a regex literal with `;`, `#` and `'` in it.
+            - name: Regex literals — sync and rollouts read them whole
+              run: examples/rollout-repro/scenarios/ci_regex.sh
+
+            - name: Concurrency — two rollout up runs at once
+              run: examples/rollout-repro/scenarios/ci_concurrency.sh
+
+            # After a rollback: run it again, or discard it and plan again.
+            - name: Rollback recovery — start again, or discard
+              run: examples/rollout-repro/scenarios/ci_rollback_recovery.sh
+
+            - name: Sync lifecycle — apply, prune, idle
+              run: examples/rollout-repro/scenarios/ci_sync_lifecycle.sh
+
+            - name: Sync typegen — the configured TypeScript file (#75)
+              run: examples/rollout-repro/scenarios/ci_sync_typegen.sh
+
+            - name: Sync on a rollout-managed database leaves the chain alone
+              run: examples/rollout-repro/scenarios/ci_sync_rollout_interop.sh
+
+    # Scenarios that need what a service container cannot give: a server on disk
+    # that can be restarted mid-scenario (#93 rewinds a sequence on 3.2 only
+    # after a restart), and a proxy that cuts the connection partway through an
+    # operation (the #94 class).
+    restart_and_faults:
+        name: Restarts and dropped connections (SurrealDB ${{ matrix.surrealdb }})
+        runs-on: ubuntu-22.04
+        timeout-minutes: 30
+        strategy:
+            fail-fast: false
+            matrix:
+                surrealdb: ["v3.2.4", "v3.3.0"]
+        env:
+            SURREALDB_USER: root
+            SURREALDB_PASSWORD: secret
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.95.0
+
+            - name: Build surrealkit (debug)
+              env:
+                  CARGO_INCREMENTAL: 0
+                  RUSTFLAGS: "-C debuginfo=0"
+              run: |
+                cargo build \
+                    --manifest-path crates/surrealkit/Cargo.toml \
+                    --bin surrealkit \
+                    --no-default-features \
+                    --features cli \
+                    --locked
+
+            - name: Start SurrealDB on disk, and SurrealDB behind toxiproxy
+              run: |
+                set -euo pipefail
+                docker network create surreal-net
+                docker run -d --user root --name surreal-disk -p 8100:8000 -v surreal-data:/data \
+                    "surrealdb/surrealdb:${{ matrix.surrealdb }}" start --user root --pass secret surrealkv:/data/db
+                docker run -d --name surrealdb --network surreal-net -p 8200:8000 \
+                    "surrealdb/surrealdb:${{ matrix.surrealdb }}" start --user root --pass secret memory
+                docker run -d --name toxiproxy --network surreal-net -p 8474:8474 -p 28000:28000 \
+                    ghcr.io/shopify/toxiproxy:2.12.0
+                for port in 8100 8200; do
+                    for _ in $(seq 1 30); do
+                        curl -sf -o /dev/null -X POST "http://127.0.0.1:$port/signin" \
+                            -H 'Content-Type: application/json' -d '{"user":"root","pass":"secret"}' && break
+                        sleep 1
+                    done
+                done
+                for _ in $(seq 1 30); do curl -sf http://127.0.0.1:8474/version && break; sleep 1; done
+
+            - name: Sequences survive re-applies and a restart (#93)
+              env:
+                  SURREALDB_HOST: ws://127.0.0.1:8100
+                  SURREAL_HTTP: http://127.0.0.1:8100
+                  SURREALDB_RESTART: docker restart surreal-disk
+              run: examples/rollout-repro/scenarios/ci_sequences.sh
+
+            - name: Rollout state survives restarts and a killed run
+              env:
+                  SURREALDB_HOST: ws://127.0.0.1:8100
+                  SURREAL_HTTP: http://127.0.0.1:8100
+                  SURREALDB_RESTART: docker restart surreal-disk
+              run: examples/rollout-repro/scenarios/ci_restart.sh
+
+            - name: Dropped connections during complete and sync converge
+              env:
+                  SURREALDB_HOST: ws://127.0.0.1:8200
+                  SURREAL_HTTP: http://127.0.0.1:8200
+                  TOXIPROXY_UPSTREAM: surrealdb:8000
+              run: examples/rollout-repro/scenarios/ci_faults.sh
+
+    # Upgrade compatibility: state written by each published release since
+    # 0.7.0 (synced schema, baselines, completed rollouts, one in flight) carried
+    # on by this build. 1.0.0-beta.3 and beta.4 never published; beta.5 contains
+    # both.
+    upgrade_compat:
+        name: Upgrade from ${{ matrix.release }} (SurrealDB ${{ matrix.surrealdb }})
+        runs-on: ubuntu-22.04
+        timeout-minutes: 20
+        strategy:
+            fail-fast: false
+            matrix:
+                release: ["v0.7.0", "v1.0.0-beta.1", "v1.0.0-beta.2", "v1.0.0-beta.5"]
+                surrealdb: ["v3.2.4", "v3.3.0"]
+        env:
+            SURREALDB_HOST: ws://127.0.0.1:8000
+            SURREAL_HTTP: http://127.0.0.1:8000
+            SURREALDB_USER: root
+            SURREALDB_PASSWORD: secret
+        services:
+            surrealdb:
+                image: surrealdb/surrealdb:${{ matrix.surrealdb }}
+                command: start --user root --pass secret memory
+                ports:
+                    - 8000:8000
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Install Rust toolchain
+              uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+              with:
+                  toolchain: 1.95.0
+
+            - name: Build surrealkit (debug)
+              env:
+                  CARGO_INCREMENTAL: 0
+                  RUSTFLAGS: "-C debuginfo=0"
+              run: |
+                cargo build \
+                    --manifest-path crates/surrealkit/Cargo.toml \
+                    --bin surrealkit \
+                    --no-default-features \
+                    --features cli \
+                    --locked
+
+            - name: Download ${{ matrix.release }}
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                set -euo pipefail
+                # The static musl build: the gnu one is linked against a newer
+                # glibc (2.38+) than this runner has.
+                asset="surrealkit-${{ matrix.release }}-x86_64-unknown-linux-musl.tar.gz"
+                mkdir -p /tmp/old
+                gh release download "${{ matrix.release }}" --repo "${{ github.repository }}" \
+                    --pattern "$asset" --pattern "$asset.sha256" --dir /tmp/old
+                (cd /tmp/old && sha256sum -c "$asset.sha256")
+                tar -xzf "/tmp/old/$asset" -C /tmp/old
+                /tmp/old/surrealkit --version
+
+            - name: Wait for SurrealDB
+              run: |
+                for _ in $(seq 1 30); do
+                    curl -sf -o /dev/null -X POST http://127.0.0.1:8000/signin \
+                        -H 'Content-Type: application/json' -d '{"user":"root","pass":"secret"}' && exit 0
+                    sleep 1
+                done
+                exit 1
+
+            - name: Carry the release's state forward
+              env:
+                  OLD_BIN: /tmp/old/surrealkit
+              run: examples/rollout-repro/upgrade/upgrade_from.sh
+
+    # The before/after harness. Separate from rollout_e2e because it builds two
+    # images, one of them the published 1.0.0-beta.1 from crates.io, and takes
+    # correspondingly longer. It asserts in both directions: beta.1 must still
+    # reproduce every bug and the working tree must not, so it cannot decay into a
+    # test that only ever passes. Without this it was documentation, not coverage.
+    rollout_repro_harness:
+        name: Reproduction harness (before/after)
+        runs-on: ubuntu-22.04
+        timeout-minutes: 45
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+            - name: Run the harness
+              run: examples/rollout-repro/run.sh
+

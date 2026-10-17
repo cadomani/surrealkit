@@ -10,7 +10,10 @@ pub mod scaffold;
 pub mod schema_state;
 pub mod seed;
 pub mod setup;
+mod surql_scan;
 pub mod sync;
+#[cfg(test)]
+mod test_db;
 pub mod tester;
 pub mod typegen;
 pub mod variables;
@@ -23,8 +26,9 @@ pub use config::{AuthLevel, DbCfg, DbOverrides, connect};
 pub use module::{Module, Partition};
 pub use project::{ProjectConfig, Target};
 pub use rollout::{
-	Rollout, RolloutAction, RolloutCompatibility, RolloutPhase, RolloutSpec, RolloutSpecBuilder,
-	RolloutStatus, RolloutStatusReport, RolloutStep, RolloutStepStatus,
+	FileRef, FrozenFile, Rollout, RolloutAction, RolloutChainReport, RolloutCompatibility,
+	RolloutPhase, RolloutSpec, RolloutSpecBuilder, RolloutStatus, RolloutStatusReport, RolloutStep,
+	RolloutStepStatus, Rollouts, UpReport,
 };
 pub use schema_state::{EntityKey, EntityKind};
 // Seeding.

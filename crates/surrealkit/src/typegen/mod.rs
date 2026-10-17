@@ -29,16 +29,18 @@ use crate::variables::TypegenTsConfig;
 /// Options for the `typegen` command.
 #[derive(Debug, Clone, Default)]
 pub struct TypegenOpts {
-	/// Explicit output path. Overrides the default `{folder}/types/schema.json`.
+	/// Output path. The CLI fills it from `--out`, else `[typegen] json` in
+	/// `surrealkit.toml`; when `None`, it is `{folder}/types/schema.json`.
 	pub out: Option<PathBuf>,
 	/// Write to stdout instead of a file.
 	pub stdout: bool,
 	/// Pretty-print the JSON.
 	pub pretty: bool,
-	/// When set, also emit TypeScript types into this directory (`index.ts`).
-	/// Configured via `[typegen] typescript` in `surrealkit.toml`.
+	/// When set, also emit TypeScript types: to this file when it ends in `.ts`
+	/// (or `.mts`/`.cts`), otherwise to `index.ts` in this directory. Configured
+	/// via `[typegen] typescript` and `filename` in `surrealkit.toml`.
 	pub ts_out: Option<PathBuf>,
-	/// Optional formatter command run on the generated `index.ts` after writing.
+	/// Optional formatter command run on the generated TypeScript file after writing.
 	/// Configured via `[typegen] format` in `surrealkit.toml`.
 	pub ts_format: Option<String>,
 	pub ts_opts: Option<TypegenTsConfig>,
@@ -50,16 +52,34 @@ pub fn render_typescript(doc: &SchemaTypes, cfg: &TypegenTsConfig) -> Result<Str
 	emit::to_typescript(doc, cfg)
 }
 
-/// Write the TypeScript types for `doc` into `dir/index.ts`, creating `dir` if
-/// needed. Returns the path written.
-pub fn write_typescript(
-	doc: &SchemaTypes,
-	dir: &std::path::Path,
-	ts_opts: &TypegenTsConfig,
-) -> Result<PathBuf> {
-	let ts: String = emit::to_typescript(doc, ts_opts)?;
-	std::fs::create_dir_all(dir)?;
-	let path = dir.join("index.ts");
+/// The file TypeScript types go to for `out`: `out` itself when it names a
+/// `.ts`, `.mts` or `.cts` file, otherwise `index.ts` inside the directory `out`.
+pub fn typescript_file(out: &std::path::Path) -> PathBuf {
+	if crate::variables::is_typescript_file(out) {
+		out.to_path_buf()
+	} else {
+		out.join(crate::variables::DEFAULT_TYPESCRIPT_FILE)
+	}
+}
+
+/// Write `doc` as JSON to `path`, creating its directory if needed.
+pub fn write_json(doc: &SchemaTypes, path: &std::path::Path, pretty: bool) -> Result<()> {
+	let json = emit::to_json(doc, pretty)?;
+	if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+		std::fs::create_dir_all(dir)?;
+	}
+	std::fs::write(path, format!("{json}\n"))?;
+	Ok(())
+}
+
+/// Write the TypeScript types for `doc` to [`typescript_file`]`(out)`, creating
+/// its directory if needed. Returns the path written.
+pub fn write_typescript(doc: &SchemaTypes, out: &std::path::Path, cfg: &TypegenTsConfig) -> Result<PathBuf> {
+	let ts = emit::to_typescript(doc, cfg)?;
+	let path = typescript_file(out);
+	if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+		std::fs::create_dir_all(dir)?;
+	}
 	std::fs::write(&path, ts)?;
 	Ok(path)
 }
@@ -69,7 +89,7 @@ pub fn write_typescript(
 /// (Biome / ESLint / Prettier). Returns the path written.
 pub fn write_typescript_formatted(
 	doc: &SchemaTypes,
-	dir: &std::path::Path,
+	out: &std::path::Path,
 	format: Option<&str>,
 	ts_opts: &TypegenTsConfig,
 ) -> Result<PathBuf> {
@@ -118,33 +138,16 @@ pub async fn generate(db: &Surreal<Any>) -> Result<SchemaTypes> {
 /// Run the `typegen` command: introspect the database, render JSON, and either
 /// print it or write it to a file.
 #[doc(hidden)]
-pub async fn run_typegen(
-	db: &Surreal<Any>,
-	folder: &str,
-	namespace: &str,
-	database: &str,
-	opts: TypegenOpts,
-) -> Result<()> {
-	let mut doc = generate(db).await?;
-	if !namespace.is_empty() {
-		doc.namespace = Some(namespace.to_string());
-	}
-	if !database.is_empty() {
-		doc.database = Some(database.to_string());
-	}
-
-	let json = emit::to_json(&doc, opts.pretty)?;
+pub async fn run_typegen(db: &Surreal<Any>, folder: &str, opts: TypegenOpts) -> Result<()> {
+	let doc = generate(db).await?;
 
 	if opts.stdout {
-		log::info!("{json}");
+		log::info!("{}", emit::to_json(&doc, opts.pretty)?);
 		return Ok(());
 	}
 
 	let path = opts.out.unwrap_or_else(|| crate::constants::typegen_output_path(folder));
-	if let Some(parent) = path.parent() {
-		std::fs::create_dir_all(parent)?;
-	}
-	std::fs::write(&path, format!("{json}\n"))?;
+	write_json(&doc, &path, opts.pretty)?;
 	log::info!("typegen: wrote {}", path.display());
 
 	if let Some(ts_dir) = &opts.ts_out {

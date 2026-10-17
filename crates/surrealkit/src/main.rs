@@ -13,8 +13,8 @@ use surrealkit::config::{DbCfg, DbOverrides, connect};
 use surrealkit::core::exec_surql;
 use surrealkit::module::Module;
 use surrealkit::project::{ProjectConfig, Target};
-use surrealkit::rollout::{self, RolloutExecutionOpts, RolloutPlanOpts};
-use surrealkit::setup::run_setup;
+use surrealkit::rollout::{self, RolloutExecutionOpts, RolloutPlanOpts, RolloutUpOpts};
+use surrealkit::setup::force_setup;
 use surrealkit::sync::{self, SyncOpts};
 use surrealkit::tester::{TestOpts, run_test};
 use surrealkit::typegen::{TypegenOpts, run_typegen};
@@ -84,6 +84,16 @@ pub struct Cli {
 	/// Root folder for the database directory (default: `./database`).
 	#[arg(long, global = true)]
 	folder: Option<String>,
+
+	/// Seconds to wait for the database connection and sign-in (default: 30).
+	/// `0` waits indefinitely, which was the behaviour through 1.0.0-beta.1.
+	#[arg(long, global = true, value_name = "SECS")]
+	connect_timeout_secs: Option<u64>,
+
+	/// Seconds to wait for a single rollout step's SQL. Unset waits
+	/// indefinitely, because a legitimate index build can take hours.
+	#[arg(long, global = true, value_name = "SECS")]
+	query_timeout_secs: Option<u64>,
 
 	/// Set a template variable (repeatable): --var KEY=VALUE
 	#[arg(long = "var", global = true, value_name = "KEY=VALUE")]
@@ -180,10 +190,16 @@ enum Commands {
 		timeout_ms: Option<u64>,
 		#[arg(long)]
 		keep_db: bool,
+		/// How each suite's database gets its schema: `sync` from the schema
+		/// folder (the default), `rollouts` replayed in order from empty, or
+		/// `both`, running every suite once on each.
+		#[arg(long, value_enum, value_name = "SOURCE")]
+		schema_from: Option<surrealkit::tester::SchemaSource>,
 	},
 	/// Introspect the database and generate a typed schema document (JSON).
 	Typegen {
-		/// Output path (default: `{folder}/types/schema.json`).
+		/// Output path (default: `[typegen] json`, else
+		/// `{folder}/types/schema.json`).
 		#[arg(long)]
 		out: Option<PathBuf>,
 		/// Print the JSON to stdout instead of writing a file.
@@ -192,9 +208,21 @@ enum Commands {
 		/// Emit compact (single-line) JSON instead of pretty-printed.
 		#[arg(long)]
 		compact: bool,
+		/// Also write TypeScript types, overriding `[typegen] typescript`: a
+		/// `.ts` file, or a directory to write `index.ts` (or `[typegen]
+		/// filename`) in.
+		#[arg(long, value_name = "PATH")]
+		typescript: Option<PathBuf>,
 	},
 }
 
+/// Rollout subcommands.
+///
+/// The rollout-id positionals are named `rollout`, not `target`: clap derives an
+/// arg id from the field name, and a positional named `target` collides with the
+/// global `-t/--target`. That collision silently ate the rollout id in
+/// 1.0.0-beta.1 (`unknown target "<rollout-id>"`) and hid `--target` from these
+/// subcommands entirely. `no_subcommand_shadows_a_global_arg_id` pins it.
 #[derive(Subcommand, Debug)]
 enum RolloutCommands {
 	Baseline,
@@ -203,27 +231,73 @@ enum RolloutCommands {
 		name: Option<String>,
 		#[arg(long)]
 		dry_run: bool,
+		/// Plan changes to entities that already exist (e.g. tightening an
+		/// ASSERT), not just additions and removals. Rollback restores the
+		/// previous definition, which reverses the schema but not any data
+		/// effect the change had.
+		#[arg(long)]
+		allow_modified: bool,
 	},
 	Start {
-		target: String,
+		#[arg(value_name = "ROLLOUT_ID")]
+		rollout: String,
 	},
 	Complete {
-		target: String,
+		#[arg(value_name = "ROLLOUT_ID")]
+		rollout: String,
 	},
 	Rollback {
-		target: String,
+		#[arg(value_name = "ROLLOUT_ID")]
+		rollout: String,
 	},
 	Status {
-		target: Option<String>,
+		#[arg(value_name = "ROLLOUT_ID")]
+		rollout: Option<String>,
 	},
+	/// Check manifests without connecting. With an id, that manifest; without
+	/// one, every manifest and how they chain, which suits a CI check.
 	Lint {
-		target: String,
+		#[arg(value_name = "ROLLOUT_ID")]
+		rollout: Option<String>,
+	},
+	/// Run every rollout this database has not run yet, in order. Each one is
+	/// started and completed, except the newest, which is left ready to complete
+	/// so the application can cut over first.
+	Up {
+		/// Complete the newest rollout too.
+		#[arg(long)]
+		complete: bool,
+		/// The first rollout this database still needs, when its position cannot
+		/// be worked out from its history.
+		#[arg(long, value_name = "ROLLOUT_ID")]
+		from: Option<String>,
+		/// Report what would run, and run nothing.
+		#[arg(long)]
+		dry_run: bool,
+	},
+	/// Give a manifest planned before 1.0.0-beta.6 its own copy of the SQL it
+	/// applies. Run it where the schema folder matches what it was planned from.
+	Freeze {
+		#[arg(value_name = "ROLLOUT_ID")]
+		rollout: String,
+	},
+	/// Drop the newest rollout from the project, as if it had never been
+	/// planned: delete its manifest and directory, and put the snapshots back to
+	/// where they were before it. Only for a rollout no database has completed.
+	Discard {
+		#[arg(value_name = "ROLLOUT_ID")]
+		rollout: String,
+		/// Leave the snapshots as they are, for when they have been put right by
+		/// hand.
+		#[arg(long)]
+		keep_snapshots: bool,
 	},
 	/// Heal a rollout stuck in an intermediate state without re-running SQL
 	/// steps. Useful when `complete` was killed mid-flight (issue #55) and
 	/// `__rollout.status` is still `running_complete` / `running_rollback`.
 	Repair {
-		target: String,
+		#[arg(value_name = "ROLLOUT_ID")]
+		rollout: String,
 	},
 }
 
@@ -352,6 +426,41 @@ impl Selection {
 			),
 		}
 	}
+
+	/// The single selected target, for commands that must not fan out.
+	///
+	/// Rollout execution is a locked, resumable state machine with one
+	/// `__rollout` record per database. Fanning one rollout id across N targets
+	/// would turn a partial failure into N databases sitting in different phases,
+	/// so these commands refuse rather than loop.
+	fn single_target(&self) -> Result<&Target> {
+		match self.targets.as_slice() {
+			[one] => Ok(one),
+			other => bail!(
+				"this command operates on one database target at a time ({} selected); \
+				 pass --target <NAME>",
+				other.len()
+			),
+		}
+	}
+}
+
+/// Warn that `--target`/`--all` does nothing on a command that never connects.
+///
+/// These commands read only the filesystem, so silently accepting the flag reads
+/// as "applied to that target" when nothing of the sort happened. A hard error
+/// was the first attempt, but it breaks CI wrappers that pass the same flags to
+/// every subcommand, and clap still advertises the globals in their `--help`
+/// because they really are accepted. Warning says the true thing without
+/// inventing a failure: there is no wrong-database hazard here, since there is no
+/// database.
+fn warn_unused_target_selection(command: &str, used: bool) {
+	if used {
+		log::warn!(
+			"{command} reads only the filesystem and never connects, so --target/--all has \
+			 no effect here and was ignored"
+		);
+	}
 }
 
 /// The outcome of applying one module to one target.
@@ -472,6 +581,8 @@ async fn main() -> Result<()> {
 		pass: args.pass,
 		auth_level: args.auth_level,
 		folder: args.folder,
+		connect_timeout_secs: args.connect_timeout_secs,
+		query_timeout_secs: args.query_timeout_secs,
 	};
 
 	let raw_vars: Vec<(String, String)> =
@@ -485,6 +596,9 @@ async fn main() -> Result<()> {
 	let project = ProjectConfig::load(None)?;
 	let selection =
 		Selection::resolve(&project, &cfg, &args.schema, &args.target, args.all, args.no_deps)?;
+	// Read before `args.command` is moved. Offline commands use it to refuse a
+	// target selection rather than accept one and silently ignore it.
+	let target_selection_used = !args.target.is_empty() || args.all;
 
 	match args.command {
 		Commands::Init {
@@ -507,7 +621,7 @@ async fn main() -> Result<()> {
 		)?,
 		Commands::Setup => {
 			let db = connect(&cfg).await?;
-			run_setup(&db, &folder).await?;
+			force_setup(&db, &folder).await?;
 		}
 		Commands::Sync {
 			watch,
@@ -520,6 +634,8 @@ async fn main() -> Result<()> {
 			allow_all_statements,
 		} => {
 			let typegen_cfg = surrealkit::variables::load_typegen_config(None)?;
+			let typegen_ts_out = typegen_cfg.typescript_path()?;
+			let typegen_json_out = typegen_cfg.json_path()?;
 			if selection.pairs() == 0 {
 				bail!(
 					"refusing filesystem sync: the selected targets accept none of the selected \
@@ -546,6 +662,7 @@ async fn main() -> Result<()> {
 						let layout = project.layout_for(&folder, &module);
 						let schema_dir = layout.schema_dir();
 						let files = sync::collect_filesystem_schema_files(
+							layout.folder(),
 							&schema_dir,
 							&module,
 							allow_empty_prune,
@@ -585,9 +702,10 @@ async fn main() -> Result<()> {
 						vars: template_vars.clone(),
 						folder: folder.clone(),
 						module: module.clone(),
-						typegen_ts_out: typegen_cfg.typescript.clone(),
+						typegen_ts_out: typegen_ts_out.clone(),
 						typegen_ts_format: typegen_cfg.format.clone(),
 						typegen_ts_opts: typegen_cfg.ts_opts.clone(),
+						typegen_json_out: typegen_json_out.clone(),
 					};
 					let outcome: std::prelude::v1::Result<(), anyhow::Error> =
 						sync::run_sync_with_filesystem_sources(&db, opts, layout, files).await;
@@ -622,90 +740,140 @@ async fn main() -> Result<()> {
 			command,
 		} => match command {
 			RolloutCommands::Baseline => {
-				let db = connect(&cfg).await?;
+				let db = connect(selection.single_target()?.cfg()).await?;
 				rollout::run_baseline(&db, &folder, selection.single_module()?).await?;
 			}
 			RolloutCommands::Plan {
 				name,
 				dry_run,
+				allow_modified,
 			} => {
+				warn_unused_target_selection("rollout plan", target_selection_used);
 				rollout::run_plan(
 					&folder,
 					RolloutPlanOpts {
 						name,
 						dry_run,
+						allow_modified,
 					},
 				)
 				.await?;
 			}
 			RolloutCommands::Start {
-				target,
+				rollout,
 			} => {
-				let db = connect(&cfg).await?;
+				let target = selection.single_target()?;
+				let db = connect(target.cfg()).await?;
 				rollout::run_start(
 					&db,
 					&folder,
 					RolloutExecutionOpts {
-						selector: Some(target),
+						selector: Some(rollout),
+						query_timeout: target.cfg().query_timeout,
 					},
 					&template_vars,
 				)
 				.await?;
 			}
 			RolloutCommands::Complete {
-				target,
+				rollout,
 			} => {
-				let db = connect(&cfg).await?;
+				let target = selection.single_target()?;
+				let db = connect(target.cfg()).await?;
 				rollout::run_complete(
 					&db,
 					&folder,
 					RolloutExecutionOpts {
-						selector: Some(target),
+						selector: Some(rollout),
+						query_timeout: target.cfg().query_timeout,
 					},
 					&template_vars,
 				)
 				.await?;
 			}
 			RolloutCommands::Rollback {
-				target,
+				rollout,
 			} => {
-				let db = connect(&cfg).await?;
+				let target = selection.single_target()?;
+				let db = connect(target.cfg()).await?;
 				rollout::run_rollback(
 					&db,
 					&folder,
 					RolloutExecutionOpts {
-						selector: Some(target),
+						selector: Some(rollout),
+						query_timeout: target.cfg().query_timeout,
 					},
 					&template_vars,
 				)
 				.await?;
 			}
 			RolloutCommands::Status {
-				target,
+				rollout,
 			} => {
-				let db = connect(&cfg).await?;
-				rollout::run_status(&db, &folder, target).await?;
+				// Status makes no rollout changes, so it is the one rollout command
+				// that may fan out across every selected target. It is not free of
+				// writes: like every other command it runs `setup` first, which
+				// scaffolds `<folder>/setup.surql` and applies the metadata DDL.
+				let fan_out = selection.targets().len() > 1;
+				for target in selection.targets() {
+					if fan_out {
+						log::info!("=== target {} ===", target.name());
+					}
+					let db = connect(target.cfg()).await?;
+					rollout::run_status(&db, &folder, rollout.clone()).await?;
+				}
 			}
 			RolloutCommands::Lint {
-				target,
+				rollout,
 			} => {
-				rollout::run_lint(
+				warn_unused_target_selection("rollout lint", target_selection_used);
+				rollout::run_lint(&folder, RolloutExecutionOpts::new(rollout)).await?;
+			}
+			RolloutCommands::Up {
+				complete,
+				from,
+				dry_run,
+			} => {
+				let target = selection.single_target()?;
+				let db = connect(target.cfg()).await?;
+				rollout::run_up(
+					&db,
 					&folder,
-					RolloutExecutionOpts {
-						selector: Some(target),
+					RolloutUpOpts {
+						complete_newest: complete,
+						from,
+						dry_run,
+						query_timeout: target.cfg().query_timeout,
+						quiet: false,
 					},
+					&template_vars,
 				)
 				.await?;
 			}
-			RolloutCommands::Repair {
-				target,
+			RolloutCommands::Discard {
+				rollout,
+				keep_snapshots,
 			} => {
-				let db = connect(&cfg).await?;
+				warn_unused_target_selection("rollout discard", target_selection_used);
+				rollout::run_discard(&folder, &rollout, keep_snapshots)?;
+			}
+			RolloutCommands::Freeze {
+				rollout,
+			} => {
+				warn_unused_target_selection("rollout freeze", target_selection_used);
+				rollout::run_freeze(&folder, &rollout)?;
+			}
+			RolloutCommands::Repair {
+				rollout,
+			} => {
+				let target = selection.single_target()?;
+				let db = connect(target.cfg()).await?;
 				rollout::run_repair(
 					&db,
 					&folder,
 					RolloutExecutionOpts {
-						selector: Some(target),
+						selector: Some(rollout),
+						query_timeout: target.cfg().query_timeout,
 					},
 				)
 				.await?;
@@ -746,6 +914,7 @@ async fn main() -> Result<()> {
 			base_url,
 			timeout_ms,
 			keep_db,
+			schema_from,
 		} => {
 			run_test(
 				env.as_ref(),
@@ -762,6 +931,7 @@ async fn main() -> Result<()> {
 					base_url,
 					timeout_ms,
 					keep_db,
+					schema_from,
 				},
 				template_vars,
 				&overrides,
@@ -772,19 +942,28 @@ async fn main() -> Result<()> {
 			out,
 			stdout,
 			compact,
+			typescript,
 		} => {
+			let mut typegen_cfg = surrealkit::variables::load_typegen_config(None)?;
+			if let Some(typescript) = typescript {
+				// A file on the command line wins outright; a directory still takes
+				// the configured file name.
+				if surrealkit::variables::is_typescript_file(&typescript) {
+					typegen_cfg.filename = None;
+				}
+				typegen_cfg.typescript = Some(typescript);
+			}
+			let ts_out = typegen_cfg.typescript_path()?;
+			let json_out = typegen_cfg.json_path()?;
 			let db = connect(&cfg).await?;
-			let typegen_cfg = surrealkit::variables::load_typegen_config(None)?;
 			run_typegen(
 				&db,
 				&folder,
-				cfg.ns(),
-				cfg.db(),
 				TypegenOpts {
-					out,
+					out: out.or(json_out),
 					stdout,
 					pretty: !compact,
-					ts_out: typegen_cfg.typescript,
+					ts_out,
 					ts_format: typegen_cfg.format,
 					ts_opts: typegen_cfg.ts_opts,
 				},
@@ -950,5 +1129,55 @@ mod selection_tests {
 	fn single_module_errors_when_several_are_selected() {
 		let sel = resolve("[schema.a]\n[schema.b]\n", &[], &[], false, false);
 		assert!(sel.single_module().is_err(), "commands that cannot fan out must refuse");
+	}
+
+	#[test]
+	fn single_target_errors_when_several_are_selected() {
+		let sel = resolve("[target.a]\n[target.b]\n", &[], &[], true, false);
+		assert!(sel.single_target().is_err(), "rollout commands must not fan out across targets");
+	}
+
+	/// A subcommand arg whose clap id matches a global arg's id is silently
+	/// swallowed: clap skips propagating the global into that subcommand, and the
+	/// subcommand's value is hoisted back into the parent under the shared id.
+	///
+	/// That is how 1.0.0-beta.1 shipped with every rollout id being parsed as a
+	/// `--target` name, which made `rollout start/complete/rollback/status/lint/
+	/// repair` fail with `unknown target "<rollout-id>"` before ever connecting.
+	///
+	/// `Command::debug_assert()` does not catch this — its duplicate-id check is
+	/// scoped within a single `Command`, and cross-level shadowing is exactly the
+	/// case it skips. So walk the tree explicitly.
+	#[test]
+	fn no_subcommand_shadows_a_global_arg_id() {
+		use clap::CommandFactory;
+
+		let root = Cli::command();
+		let globals: Vec<String> = root
+			.get_arguments()
+			.filter(|a| a.is_global_set())
+			.map(|a| a.get_id().to_string())
+			.collect();
+		assert!(!globals.is_empty(), "expected at least one global arg to guard");
+
+		fn walk(cmd: &clap::Command, globals: &[String], path: &str, bad: &mut Vec<String>) {
+			for sub in cmd.get_subcommands() {
+				let here = format!("{path} {}", sub.get_name());
+				for arg in sub.get_arguments() {
+					let id = arg.get_id().to_string();
+					if globals.contains(&id) {
+						bad.push(format!("`{}` redefines global arg id `{id}`", here.trim()));
+					}
+				}
+				walk(sub, globals, &here, bad);
+			}
+		}
+
+		let mut bad = Vec::new();
+		walk(&root, &globals, "", &mut bad);
+		assert!(bad.is_empty(), "argument id shadowing:\n  {}", bad.join("\n  "));
+
+		// Cheap extra: catches same-level duplicates, which this walk does not.
+		Cli::command().debug_assert();
 	}
 }

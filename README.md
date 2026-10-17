@@ -134,6 +134,8 @@ Embedded engines are single-process, so run the CLI while your application is st
 > than ignoring it — ignoring it would silently fall back to the defaults and
 > connect to the wrong database.
 - `SURREALDB_FOLDER` — root folder for schema, rollouts, snapshots, seed, and tests (default: `./database`)
+- `SURREALDB_CONNECT_TIMEOUT_SECS` — deadline for connect and sign-in (default: `30`; `0` waits indefinitely)
+- `SURREALDB_QUERY_TIMEOUT_SECS` — deadline for a single rollout step's SQL (unset waits indefinitely)
 
 These can be set as system environment variables or in a `.env` file.
 
@@ -315,6 +317,26 @@ db = "analytics"
 schemas = ["core", "analytics"]
 ```
 
+It may also override the connection deadlines, which is useful when one target
+is across a slower link than the rest:
+
+```toml
+[target.warehouse]
+connect_timeout_secs = 60   # default 30; 0 waits indefinitely
+query_timeout_secs = 900    # default unset, meaning no deadline on step SQL
+```
+
+Full key list for `[target.<name>]`: `host`, `ns`, `db`, `user`, `pass_env`,
+`auth_level`, `schemas`, `primary`, `connect_timeout_secs`,
+`query_timeout_secs`.
+
+**A value set here wins over the equivalent CLI flag and environment variable.**
+That holds for every key, not just the timeouts: naming a target selects a
+described connection, so `--host` does not override a target's `host`, and
+`--connect-timeout-secs 5 --target warehouse` uses the target's
+`connect_timeout_secs` if it sets one. Omit the key to inherit, where the order
+is CLI flag, then environment variable, then `.env`, then the default.
+
 ### Fan-out semantics
 
 Targets are applied one at a time. Modules within a target stop at the first
@@ -337,21 +359,40 @@ surrealkit typegen --stdout        # print instead
 surrealkit typegen --out types.json
 ```
 
-Configure TypeScript output in `surrealkit.toml`:
+Configure the outputs in `surrealkit.toml`:
 
 ```toml
 [typegen]
-# Directory for generated TypeScript. Setting this enables TS generation:
-# `surrealkit typegen` and `surrealkit sync` both write <dir>/index.ts.
+# Where generated TypeScript goes. Setting this enables TS generation:
+# `surrealkit typegen` and `surrealkit sync` both write it.
 typescript = "src/types"
+
+# The file to write in that directory (default: index.ts). Naming it leaves
+# index.ts free to be your package's own barrel.
+filename = "schema.generated.ts"
 
 # Optional formatter run on the generated file. The path is appended as the
 # final argument. Failures are warnings, not errors.
 format = "biome check --write"
+
+# Where the JSON schema document goes (written as schema.json in that
+# directory). Setting this makes `surrealkit sync` write it too, and
+# `surrealkit typegen` writes it here instead of database/types.
+json = "src/types"
 ```
 
-With `typescript` set, `surrealkit sync` regenerates types after applying schema
-changes, so the generated types never drift from the database.
+`typescript` can also name the file itself, as in
+`typescript = "src/types/database.ts"` (any `.ts`, `.mts` or `.cts` path), in
+which case `filename` is not used. `surrealkit typegen --typescript <path>`
+overrides the configured path for one run.
+
+`json` can also name the file itself, as in `json = "src/types/database.json"`
+(any `.json` path). `surrealkit typegen --out <path>` overrides the configured
+path for one run.
+
+With `typescript` or `json` set, `surrealkit sync` regenerates them after
+applying schema changes, so the generated types never drift from the database.
+Use `json` when you generate your own types from the schema document.
 
 ## Vite Plugin
 
@@ -364,11 +405,11 @@ npm install --save-dev vite-plugin-surrealkit
 
 ```ts
 // vite.config.ts
-import surrealkit from "vite-plugin-surrealkit";
+import { surrealkitPlugin } from "vite-plugin-surrealkit";
 
 export default defineConfig({
     plugins: [
-        surrealkit({
+        surrealkitPlugin({
             schemas: ["core", "billing"],   // optional: restrict modules
             reloadOnSync: true,
         }),
@@ -376,7 +417,8 @@ export default defineConfig({
 });
 ```
 
-See the [plugin README](packages/vite-plugin-surrealkit/README.md) for all options.
+Requires Vite 8. See the
+[plugin README](packages/vite-plugin-surrealkit/README.md) for all options.
 
 ## Team Workflow
 
@@ -417,18 +459,104 @@ surrealkit rollout baseline
 surrealkit rollout plan --name add_customer_indexes
 ```
 
-6. Start the rollout, let application cutover happen, then complete it:
+`plan` handles additions and removals on its own. A change to an entity that
+already exists — tightening an `ASSERT`, adjusting `PERMISSIONS` — needs
+`--allow-modified`:
+
+```sh
+surrealkit rollout plan --name tighten_age_assert --allow-modified
+```
+
+The opt-in is about rollback, not about applying the change: applying it is just
+`DEFINE ... OVERWRITE`. Undoing it means restoring the previous definition, which
+`start` captures from the live database before the expand phase. That is a clean
+undo for `ASSERT`, `PERMISSIONS` and `COMMENT`, and only a partial one for `TYPE`,
+`VALUE` or `DEFAULT` changes, since it reverses the schema but not data written
+under the new definition. Such a rollout is recorded as
+`reversibility: definition_only` and `rollout status` says so.
+
+`plan` freezes a copy of every schema file the rollout changes into a directory
+beside the manifest, `database/rollouts/<id>/`, and records each file's sha256 in
+the manifest. The rollout applies those copies, not whatever `database/schema`
+holds when it runs, so a rollout planned for release 1.0.3 still applies 1.0.3's
+SQL when a database catches up to 1.0.5. Frozen files are what was reviewed:
+editing one fails the rollout with a hash mismatch; plan a new rollout instead.
+
+`plan` also writes the snapshots, so commit the manifest, its directory and the
+snapshots together. Reverting a plan you decided not to run means reverting all
+three.
+
+Steps you add to a manifest by hand (a `run_sql` backfill, an `assert_sql`
+check) travel with it, and run wherever it runs.
+
+6. Deploy with `rollout up`, let application cutover happen, then complete:
+
+```sh
+surrealkit rollout up               # every pending rollout, in order
+# deploy the application
+surrealkit rollout up --complete    # finish the newest
+```
+
+`up` works out where the database is (from its completed rollouts, or for a
+database that has only been baselined, from the file hashes `baseline` stored)
+and runs every rollout it has not run yet, in order. Each one is started and
+completed, except the newest, which is started and left `ready_to_complete` so
+the old and new application can overlap. Running `up` again leaves it waiting;
+`up --complete` or `rollout complete <id>` finishes it.
+
+Catching up across several releases runs the older rollouts' contract phases
+straight away, so anything they remove is gone before the new application
+starts. That is the same as running each release's deploy in turn.
+
+Rollouts can still be driven one at a time:
 
 ```sh
 surrealkit rollout start 20260302153045__add_customer_indexes
 surrealkit rollout complete 20260302153045__add_customer_indexes
 ```
 
+`start` refuses a rollout whose predecessors have not run here, and names them.
+
+`surrealkit rollout up --dry-run` shows what would run. `--from <id>` names the
+first rollout a database still needs, when its history cannot say: say, one
+whose schema was applied by hand.
+
+A new database should get its schema with `surrealkit sync` and then
+`surrealkit rollout baseline`, after which `up` has nothing to do. If the first
+rollout in the project was planned from an empty schema folder, `up` can also
+build a database from nothing.
+
 7. Roll back an in-flight rollout if needed:
 
 ```sh
 surrealkit rollout rollback 20260302153045__add_customer_indexes
 ```
+
+A rolled-back rollout leaves the database where it was before it, and nothing
+planned after it can run until you decide what to do with it. `rollout up`
+stops and asks; it does not re-run it on its own. Either:
+
+- fix whatever made you roll it back, then run it again by name. `up` carries
+  on from there:
+
+  ```sh
+  surrealkit rollout start 20260302153045__add_customer_indexes
+  surrealkit rollout up
+  ```
+
+- or drop it from the project and plan again:
+
+  ```sh
+  surrealkit rollout discard 20260302153045__add_customer_indexes
+  surrealkit rollout plan --name add_customer_indexes
+  ```
+
+  `discard` deletes the manifest and its directory, and puts `snapshots/` back
+  to where they were before it was planned. Each rollout's directory keeps
+  those snapshots for this. Deleting a manifest by hand leaves the snapshots at
+  the end of the discarded rollout, so the next plan would find nothing to do.
+  Only discard the newest rollout, and only one that no database has completed:
+  a database that ran it can no longer be placed in the chain.
 
 Generated rollout manifests are written to `database/rollouts/*.toml`.
 Local snapshots are tracked in:
@@ -441,6 +569,41 @@ To validate a rollout manifest without mutating the database:
 ```sh
 surrealkit rollout lint 20260302153045__add_customer_indexes
 ```
+
+Without an id, `lint` checks every manifest and how they chain, without
+connecting. That suits a CI check:
+
+```sh
+surrealkit rollout lint
+```
+
+It fails on:
+- two rollouts planned from the same snapshots (two branches each ran `plan`;
+  delete the later one and plan it again after merging)
+- a gap in the chain
+- a frozen file that does not match its manifest
+- schema files that no rollout plans yet
+
+Manifests planned before 1.0.0-beta.6 do not carry their SQL, and can only run
+against the schema they were planned from. `lint` lists them. To let a
+database catch up across one, check out the commit that planned it and run:
+
+```sh
+surrealkit rollout freeze 20260302153045__add_customer_indexes
+```
+
+If you check out on Windows, keep git from converting line endings in frozen
+files, which would change their hashes:
+
+```gitattributes
+database/rollouts/** -text
+```
+
+`rollout status` lists, after the rollout records:
+- a rollout in flight (started, not completed) or rolled back here;
+- what is still pending, in order;
+- any rollout the database moved past without running, whose data steps never
+  ran there.
 
 To inspect rollout state stored in the database:
 
@@ -460,9 +623,41 @@ To allow non-`DEFINE` statements (e.g. `INSERT`, `UPDATE`, `CREATE`) in schema f
 surrealkit sync --allow-all-statements
 ```
 
+### How schema files are applied
+
+Sync and rollouts re-apply whole files, so every `DEFINE` is made safe to run
+again: SurrealKit adds `OVERWRITE`, and turns `IF NOT EXISTS` into `OVERWRITE`
+so a changed definition is applied. Everything else in the statement, comments
+and regex literals included, reaches the server exactly as written.
+
+`DEFINE SEQUENCE` is the exception, because a sequence's definition carries its
+counter: `OVERWRITE` puts it back to `START` (immediately on SurrealDB 3.3, after
+a restart on 3.2), and the ids it hands out next collide with existing records.
+A plain `DEFINE SEQUENCE` is applied as `IF NOT EXISTS`, and an explicit
+`IF NOT EXISTS` is kept. A changed definition therefore does not reach a database
+where the sequence exists, and sync says so. An explicit `OVERWRITE` is applied as
+written, with a warning every time. Reposition a sequence deliberately, in a
+rollout `run_sql` step or by hand.
+
+A record `DEFINE ACCESS` with no `WITH JWT ... KEY` gets a new random signing key
+every time it is overwritten, which signs every user out. SurrealKit warns when it
+applies one. Give it a stable key, for example
+`WITH JWT ALGORITHM HS512 KEY ${JWT_SECRET}`.
+
+A file SurrealKit cannot read (an unterminated string, an unmatched bracket, a
+`DEFINE` that starts inside another statement) stops sync or plan with the file,
+line and column, before anything is applied or pruned.
+
 `surrealkit sync` is the local/dev reconciliation path. `surrealkit rollout ...` is the shared/prod migration path.
 
 ### Recovering a stuck rollout
+
+Connect and sign-in are bounded by `--connect-timeout-secs` (30s by default), so
+an endpoint that accepts the connection and never responds fails with a message
+naming it rather than blocking. Step SQL is not bounded by default — a legitimate
+index build can take hours — but every step logs when it starts and every 15
+seconds while it runs, so a slow step is distinguishable from a stuck one. Bound
+it explicitly with `--query-timeout-secs` when you want to.
 
 If `surrealkit rollout complete` (or `rollback`) is killed mid-flight, the
 `__rollout` row can be left in an intermediate state — `running_complete`,
@@ -605,6 +800,35 @@ The runner performs filesystem sync first, so the same non-empty source prefligh
 applies. Use `--no-sync` when the suite's fixtures intentionally own the complete
 schema instead.
 
+### Testing against replayed rollouts
+
+A suite can get its database's schema from the rollouts instead of sync, the
+way production got it:
+
+```toml
+# database/tests/config.toml
+[defaults]
+schema_from = "both"   # "sync" (the default), "rollouts", or "both"
+```
+
+With `rollouts`, each suite's database is built by replaying every rollout in
+order from an empty database, which needs the first rollout to have been
+planned from an empty schema folder. With `both`, every suite runs once on each,
+reported as `name [sync]` and `name [rollouts]`. A suite can set `schema_from`
+itself, and `surrealkit test --schema-from <source>` overrides both.
+
+Whenever rollouts are replayed, a parity check runs first. It builds one
+database with sync and one from the rollouts, and fails on any definition they
+disagree on. That is how a schema change nobody planned a rollout for shows up.
+Turn it off with:
+
+```toml
+[rollouts]
+parity = false
+```
+
+See [examples/rollout-testing](examples/rollout-testing).
+
 ### CLI Flags
 
 `surrealkit test` supports:
@@ -621,6 +845,7 @@ schema instead.
 - `--base-url <url>`
 - `--timeout-ms <ms>`
 - `--keep-db`
+- `--schema-from <sync|rollouts|both>`
 
 ### Global Config
 
@@ -670,11 +895,19 @@ path = "0.id"
 exists = true
 ```
 
+A `sql_expect` case asserts against the result of the first statement in its
+`sql`. To check something a write produced, select it in a single statement
+(`CREATE ... RETURN AFTER`), or put the write in a fixture and the check in the
+case.
+
 An assertion whose `path` (or `header_assertions` `name`) is not present in the result
 **fails** with `path '<path>' not found`. This catches typos and queries that matched
 zero rows, which would otherwise report a pass without ever running the comparison. To
 assert that a field is genuinely absent, state it explicitly with `exists = false` —
-that is the only spec that passes on a missing path.
+that is the only spec that passes on a missing path. TOML has no null, so a field
+that is present but `NONE` (JSON `null`) is best checked in the query itself,
+e.g. `sql = "RETURN (SELECT VALUE nickname FROM ONLY person:ann) IS NONE"` with
+`{ path = ".", equals = true }`.
 
 To compare a returned field against the authenticated actor, use `equals_auth` with `$auth` or `$auth.<property>`:
 
@@ -729,6 +962,7 @@ table = "order"
 record_id = "perm_test"
 
 [[cases.rules]]
+name = "reader can see orders"
 action = "select"
 allow = true
 
@@ -736,6 +970,69 @@ allow = true
 action = "update"
 allow = false
 error_contains = "permission"
+```
+
+A rule's `name` is what the report shows; without one it reads `action:update (#2)`.
+
+Update and delete rules act on a copy of the record, with a new id, so the
+record itself is untouched. Create rules create a new record with its content.
+
+`record_id = "$auth"` targets the record the actor is signed in as:
+
+```toml
+[actors.record]
+kind = "record"
+access = "human_passphrase"
+signup_params = { email = "user@example.test", passphrase = "abc" }
+signin_params = { email = "user@example.test", passphrase = "abc" }
+
+[[cases]]
+name = "user can be created and signed in and read its own record"
+kind = "permissions_matrix"
+actor = "record"
+table = "user"
+record_id = "$auth"
+
+[[cases.rules]]
+name = "reads its own record"
+action = "select"
+allow = true
+
+[[cases.rules]]
+name = "updates its own record"
+action = "update"
+allow = true
+```
+
+With `$auth`, update and delete rules act on the record itself, because a
+permission written as `WHERE id = $auth` can never match a copy. Root puts the
+record back afterwards: an update is reverted with the record's original content
+(fields computed with `VALUE` are recomputed then), and a deleted record is
+created again (anything the delete cascaded to through `REFERENCE ... ON DELETE`
+is not). `table` must be the table of the signed-in record. A create rule on
+`$auth` is rejected when the suite loads, since signup already created it.
+
+On a table with a `UNIQUE` index, a copy of a record duplicates the original in
+that index, and SurrealDB refuses to create it. Update and delete rules then act
+on the record itself and root puts it back afterwards, the same way as for
+`$auth` above. A table without a unique index, or one whose copy doesn't
+collide, still gets a copy.
+
+A create rule has no record to fall back on. A permission that refuses a create
+makes SurrealDB return no record, so an `allow = false` create rule still
+passes when the permission says no. When the create is refused by a unique
+index instead, the rule fails with a message naming the index, whatever `allow`
+says, so a collision is never counted as a denial. To test that a create is
+allowed on such a table, use a `sql_expect` case that sets its own unique
+values:
+
+```toml
+[[cases]]
+name = "an admin can create an account"
+kind = "sql_expect"
+actor = "admin"
+sql = "CREATE ONLY account SET email = 'new@example.test', passphrase = 'x'"
+assertions = [{ path = "email", equals = "new@example.test" }]
 ```
 
 ### JSON Reports for CI

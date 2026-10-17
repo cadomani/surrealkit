@@ -103,6 +103,8 @@ fn make_cfg(url: &str, scope: &str, auth_level: AuthLevel, user: &str, pass: &st
 				.into(),
 			),
 			folder: None,
+			connect_timeout_secs: None,
+			query_timeout_secs: None,
 		},
 	)
 	.expect("DbCfg::from_env")
@@ -320,6 +322,7 @@ async fn test_runner_rejects_database_auth_level() {
 		base_url: None,
 		timeout_ms: None,
 		keep_db: false,
+		schema_from: None,
 	};
 	let err = run_test(None, opts, TemplateVars::default(), &overrides)
 		.await

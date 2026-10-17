@@ -13,12 +13,14 @@ use crate::constants::Layout;
 use crate::core::{exec_surql, sha256_hex};
 use crate::module::{Module, Partition};
 use crate::rollout::{
-	acquire_lock, delete_managed_entities, delete_sync_hashes, load_active_rollout_id,
-	load_managed_entities, release_lock, upsert_managed_entities,
+	ManagedEntityRecord, PartitionWrite, acquire_lock, delete_managed_entities, delete_sync_hashes,
+	load_active_rollout_id, load_managed_entities, release_lock, upsert_managed_entities,
+	write_partition,
 };
 use crate::schema_state::{
-	CatalogEntity, EntityKey, SchemaFile, build_catalog_snapshot, collect_schema_files_at,
-	ensure_local_state_dirs_for, ensure_overwrite, render_remove_sql,
+	CatalogEntity, EntityKey, EntityKind, SchemaFile, Unmatched, build_catalog_snapshot,
+	canonicalise_keys, collect_schema_files_at, ensure_local_state_dirs_for, overwrite_sequences,
+	prepare_schema_sql, reconcile_garbled, render_remove_sql,
 };
 use crate::setup::{run_setup, run_setup_embedded};
 use crate::variables::{TemplateVars, TypegenTsConfig};
@@ -48,14 +50,18 @@ pub struct SyncOpts {
 	/// never removes another module's database objects.
 	pub module: Module,
 	/// When set (via `[typegen] typescript` in `surrealkit.toml`), regenerate
-	/// TypeScript types into this directory after applying schema changes.
+	/// TypeScript types after applying schema changes: into this file when it
+	/// ends in `.ts`, otherwise into `index.ts` in this directory.
 	pub typegen_ts_out: Option<std::path::PathBuf>,
 	/// Optional formatter command (`[typegen] format`) run on the regenerated
-	/// `index.ts`.
+	/// TypeScript file.
 	pub typegen_ts_format: Option<String>,
 	/// Optional flag to emit a union of table names, and a mapping of table names to their types.
 	/// Configured via `[typegen] emit` in `surrealkit.toml`.
 	pub typegen_ts_opts: Option<TypegenTsConfig>,
+	/// When set (via `[typegen] json` in `surrealkit.toml`), write the JSON
+	/// schema document to this file after applying schema changes.
+	pub typegen_json_out: Option<std::path::PathBuf>,
 }
 
 /// A schema file embedded into the binary at compile time (via [`embed_schema!`](crate::embed_schema))
@@ -79,6 +85,7 @@ pub struct EmbeddedSchemaFile {
 pub async fn run_sync(db: &Surreal<Any>, opts: SyncOpts) -> Result<()> {
 	let layout = Layout::new(opts.folder.clone(), opts.module.clone());
 	let files = collect_filesystem_schema_files(
+		layout.folder(),
 		&layout.schema_dir(),
 		layout.module(),
 		opts.allow_empty_prune,
@@ -89,11 +96,12 @@ pub async fn run_sync(db: &Surreal<Any>, opts: SyncOpts) -> Result<()> {
 /// Resolve and validate filesystem schema sources before a CLI caller connects.
 #[doc(hidden)]
 pub fn collect_filesystem_schema_files(
+	root: &str,
 	schema_dir: &std::path::Path,
 	module: &Module,
 	allow_empty_prune: bool,
 ) -> Result<Vec<SchemaFile>> {
-	let files = collect_schema_files_at(schema_dir)?;
+	let files = collect_schema_files_at(root, schema_dir)?;
 	if files.is_empty() && !allow_empty_prune {
 		bail!(
 			"refusing filesystem sync: schema_module={} resolved_schema_dir={} source_count=0; \
@@ -117,7 +125,7 @@ pub async fn run_sync_with_filesystem_sources(
 	run_setup(db, layout.folder()).await?;
 	ensure_local_state_dirs_for(layout)?;
 	if opts.watch {
-		run_sync_with_files(db, &opts, layout, files, true).await?;
+		run_sync_with_files(db, &opts, layout, files, true, Substituted::No).await?;
 		log::info!(
 			"Watch mode active ({}ms interval). Waiting for schema changes... (Ctrl+C to stop)",
 			opts.debounce_ms.max(250)
@@ -141,7 +149,7 @@ pub async fn run_sync_with_filesystem_sources(
 		}
 		Ok(())
 	} else {
-		run_sync_with_files(db, &opts, layout, files, false).await
+		run_sync_with_files(db, &opts, layout, files, false, Substituted::No).await
 	}
 }
 
@@ -276,6 +284,7 @@ impl<'a> Sync<'a> {
 			typegen_ts_out: None,
 			typegen_ts_format: None,
 			typegen_ts_opts: None,
+			typegen_json_out: None,
 		};
 		sync_embedded(db, self.files, &opts).await
 	}
@@ -306,7 +315,18 @@ async fn sync_embedded(
 		})
 		.collect::<anyhow::Result<Vec<_>>>()?;
 	let layout = Layout::new(opts.folder.clone(), opts.module.clone());
-	run_sync_with_files(db, opts, &layout, &schema_files, false).await
+	// The files above are already substituted. Their catalog, and so the entity
+	// keys already in `__entity`, come from the substituted text, so that stays;
+	// what must not happen is a second substitution at apply time, which turned a
+	// `$${X}` escape into `${X}` and then substituted or rejected it.
+	run_sync_with_files(db, opts, &layout, &schema_files, false, Substituted::Yes).await
+}
+
+/// Whether a file's SQL has had template variables applied yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Substituted {
+	Yes,
+	No,
 }
 
 async fn run_sync_once(
@@ -315,8 +335,8 @@ async fn run_sync_once(
 	layout: &Layout,
 	watch_mode: bool,
 ) -> Result<()> {
-	let files = collect_schema_files_at(&layout.schema_dir())?;
-	run_sync_with_files(db, opts, layout, &files, watch_mode).await
+	let files = collect_schema_files_at(layout.folder(), &layout.schema_dir())?;
+	run_sync_with_files(db, opts, layout, &files, watch_mode, Substituted::No).await
 }
 
 async fn run_sync_with_files(
@@ -325,10 +345,49 @@ async fn run_sync_with_files(
 	layout: &Layout,
 	files: &[SchemaFile],
 	watch_mode: bool,
+	substituted: Substituted,
 ) -> Result<()> {
+	let substitute = |sql: &str, source: &str| -> Result<String> {
+		match substituted {
+			Substituted::Yes => Ok(sql.to_string()),
+			Substituted::No => opts
+				.vars
+				.apply(sql)
+				.with_context(|| format!("applying template variables in {source}")),
+		}
+	};
 	let desired_catalog = build_catalog_snapshot(files, opts.allow_all_statements)?;
-	let tracked = load_sync_hashes(db, layout.module()).await?;
-	let managed = load_managed_entities(db, layout.module()).await?;
+	let tracked = migrate_legacy_sync_keys(db, layout, files, opts.dry_run).await?;
+	let mut managed = load_managed_entities(db, layout.module(), Some(layout.folder())).await?;
+	// Rows an older release recorded under a cut-short quoted name. Left alone,
+	// they read as stale, and pruning them issues a REMOVE that cannot parse.
+	let garbled = {
+		let mut entities: Vec<CatalogEntity> = managed.iter().map(|r| r.entity.clone()).collect();
+		let repaired = reconcile_garbled(&mut entities, &desired_catalog.entities, Unmatched::Drop);
+		if !repaired.is_empty() {
+			managed = entities
+				.into_iter()
+				.map(|entity| ManagedEntityRecord {
+					entity,
+					active_rollout_id: None,
+					state: "active".to_string(),
+				})
+				.collect();
+		}
+		repaired
+	};
+	for sequence in
+		changed_sequences(&managed, &desired_catalog.entities, &overwrite_sequences(files))
+	{
+		log::warn!(
+			"{}: the definition of sequence `{}` changed, but SurrealKit applies sequences with IF \
+			 NOT EXISTS so an existing one keeps its old settings and position. Redefining it with \
+			 OVERWRITE resets the counter to START; do that deliberately, in a rollout run_sql step \
+			 or by hand.",
+			sequence.source_path,
+			sequence.name
+		);
+	}
 
 	if files.is_empty() && !watch_mode {
 		log::info!("No schema files found in {}", layout.schema_dir().display());
@@ -357,12 +416,17 @@ async fn run_sync_with_files(
 			continue;
 		}
 
-		let substituted = opts
-			.vars
-			.apply(&file.sql)
-			.with_context(|| format!("applying template variables in {}", file.path))?;
-		let sql = ensure_overwrite(&substituted);
-		match exec_surql(db, &sql).await {
+		let sql = substitute(&file.sql, &file.path)?;
+		let applied = match prepare_schema_sql(&sql) {
+			Ok(prepared) => {
+				for warning in crate::rollout::relevant_warnings(db, prepared.warnings).await {
+					log::warn!("{}: {warning}", file.path);
+				}
+				exec_surql(db, &prepared.sql).await
+			}
+			Err(err) => Err(err.context(format!("preparing {} for apply", file.path))),
+		};
+		match applied {
 			Ok(_) => {
 				if !watch_mode {
 					log::info!("applied {}", file.path);
@@ -419,6 +483,28 @@ async fn run_sync_with_files(
 		// prune here drops the whole schema. In practice this means the folder is
 		// wrong (a mistyped --folder, or running from the wrong directory), not that
 		// the user meant to tear the database down.
+		// The key migration above rewrites legacy spellings onto the canonical
+		// ones. If it matched nothing while files exist and the store was not
+		// empty, the match is broken and every tracked key looks removed — which
+		// would prune the whole schema. Refuse rather than act on that.
+		if opts.prune
+			&& !files.is_empty()
+			&& !tracked.is_empty()
+			&& tracked.keys().all(|key| !files.iter().any(|f| &f.path == key))
+			&& !opts.allow_empty_prune
+		{
+			bail!(
+				"refusing to prune: none of the {} tracked file key(s) match the {} schema \
+				 file(s) found in {}.\n\
+				 That usually means the project folder moved or the tracking keys were \
+				 written by a different layout, not that every file was deleted.\n\
+				 Check --folder / SURREALDB_FOLDER, or pass --allow-empty-prune to proceed \
+				 anyway.",
+				tracked.len(),
+				files.len(),
+				layout.schema_dir().display()
+			);
+		}
 		if opts.prune && files.is_empty() && !opts.allow_empty_prune {
 			bail!(
 				"refusing to prune all {stale_count} managed entities: no schema files were found{}.\n\
@@ -436,6 +522,9 @@ async fn run_sync_with_files(
 
 	if !opts.dry_run {
 		upsert_managed_entities(db, layout.module(), &effective_entities, None, "active").await?;
+		if !garbled.is_empty() {
+			delete_managed_entities(db, layout.module(), &garbled).await?;
+		}
 		if !removed_paths.is_empty() {
 			delete_sync_hashes(db, layout.module(), &removed_paths).await?;
 		}
@@ -480,7 +569,10 @@ async fn run_sync_with_files(
 			}
 		} else {
 			for op in &pending_operations {
-				match exec_surql(db, &op.sql).await {
+				// Operations come from the unsubstituted file on the filesystem path,
+				// so they need the same substitution the file apply got.
+				let sql = substitute(&op.sql, &op.source_path)?;
+				match exec_surql(db, &sql).await {
 					Ok(_) => {
 						if !watch_mode {
 							log::info!("ran operation from {}", op.source_path);
@@ -505,23 +597,37 @@ async fn run_sync_with_files(
 
 	let has_changes = changed_count > 0 || stale_count > 0 || !removed_paths.is_empty();
 
-	// Regenerate TypeScript types when configured. Gate on actual changes (or a
+	// Regenerate the configured type outputs. Gate on actual changes (or a
 	// missing output file) so idle watch ticks don't re-introspect every cycle.
-	if let Some(ts_dir) = &opts.typegen_ts_out
-		&& !opts.dry_run
-	{
-		let ts_path = ts_dir.join("index.ts");
-		if has_changes || !ts_path.exists() {
+	if !opts.dry_run {
+		let ts_due_at_path = opts
+			.typegen_ts_out
+			.as_deref()
+			.filter(|out| has_changes || !crate::typegen::typescript_file(out).exists());
+		let json_due_at_path =
+			opts.typegen_json_out.as_deref().filter(|path| has_changes || !path.exists());
+
+		if ts_due_at_path.is_some() || json_due_at_path.is_some() {
 			match crate::typegen::generate(db).await {
-				Ok(doc) => match crate::typegen::write_typescript_formatted(
-					&doc,
-					ts_dir,
-					opts.typegen_ts_format.as_deref(),
-					&opts.typegen_ts_opts.clone().unwrap_or_default(),
+				Ok(doc) => {
+					if let Some(ts_path) = ts_due_at_path {
+						match crate::typegen::write_typescript_formatted(
+							&doc,
+							ts_path,
+							opts.typegen_ts_format.as_deref(),
+							&opts.typegen_ts_opts.clone().unwrap_or_default(),
 				) {
-					Ok(path) => log::info!("typegen: wrote {}", path.display()),
-					Err(err) => log::error!("typegen: failed to write types: {err:#}"),
-				},
+							Ok(path) => log::info!("typegen: wrote {}", path.display()),
+							Err(err) => log::error!("typegen: failed to write types: {err:#}"),
+						}
+					}
+					if let Some(json_path) = json_due_at_path {
+						match crate::typegen::write_json(&doc, json_path, true) {
+							Ok(()) => log::info!("typegen: wrote {}", json_path.display()),
+							Err(err) => log::error!("typegen: failed to write JSON: {err:#}"),
+						}
+					}
+				}
 				Err(err) => log::error!("typegen: failed to introspect schema: {err:#}"),
 			}
 		}
@@ -575,7 +681,50 @@ async fn prune_managed_entities(
 	delete_managed_entities(db, module, stale_entities).await
 }
 
-async fn load_sync_hashes(db: &Surreal<Any>, module: &Module) -> Result<BTreeMap<String, String>> {
+/// Load tracked file hashes, rewriting any pre-1.0.0-beta.2 keys to the
+/// folder-relative form first.
+///
+/// Keys used to be working-directory-relative, so the same project tracked under
+/// `database/schema/a.surql` locally and `/database/schema/a.surql` in a
+/// container. Left alone, every file would look new *and* every old key would
+/// look removed, which is a schema-wide prune. Match legacy keys by path suffix,
+/// migrate them in place, and say how many moved.
+async fn migrate_legacy_sync_keys(
+	db: &Surreal<Any>,
+	layout: &Layout,
+	files: &[SchemaFile],
+	dry_run: bool,
+) -> Result<BTreeMap<String, String>> {
+	let stored = load_sync_hashes(db, layout.module()).await?;
+	let canonical: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
+	let (migrated, re_keyed) = canonicalise_keys(&stored, &canonical);
+
+	if re_keyed.is_empty() {
+		return Ok(migrated);
+	}
+
+	// A matcher that finds nothing while the store is non-empty means the matcher
+	// is broken, not that every file was deleted. Guarded at the prune site.
+	log::info!(
+		"re-keyed {} tracked file(s) to folder-relative paths (e.g. {} -> {})",
+		re_keyed.len(),
+		re_keyed[0].0,
+		re_keyed[0].1
+	);
+	if !dry_run {
+		for (legacy, target) in &re_keyed {
+			let hash = migrated.get(target).cloned().unwrap_or_default();
+			delete_sync_hashes(db, layout.module(), std::slice::from_ref(legacy)).await?;
+			store_sync_hash(db, layout.module(), target, &hash).await?;
+		}
+	}
+	Ok(migrated)
+}
+
+pub(crate) async fn load_sync_hashes(
+	db: &Surreal<Any>,
+	module: &Module,
+) -> Result<BTreeMap<String, String>> {
 	let mut resp = db
 		.query("SELECT key, val FROM __entity WHERE ns = $ns;")
 		.bind(("ns", module.partition(Partition::Sync)))
@@ -641,15 +790,32 @@ async fn store_last_sync_meta(db: &Surreal<Any>) -> Result<()> {
 }
 
 async fn upsert_meta(db: &Surreal<Any>, key: &str, value: serde_json::Value) -> Result<()> {
-	db.query(
-		"DELETE __entity WHERE ns = 'meta' AND key = $key; \
-		 CREATE __entity CONTENT { ns: 'meta', key: $key, val: $value, updated_at: time::now() };",
-	)
-	.bind(("key", key.to_string()))
-	.bind(("value", value))
-	.await?
-	.check()?;
-	Ok(())
+	// In place, not delete-then-create: those were two transactions, so a failed
+	// create lost the row.
+	let rows = BTreeMap::from([(key.to_string(), value)]);
+	write_partition(db, Partition::Meta.as_str(), &rows, PartitionWrite::Merge).await
+}
+
+/// Managed sequences whose definition changed, apart from those the files now
+/// define with an explicit `OVERWRITE` (applying those does reset them, and
+/// `prepare_schema_sql` warns about that instead).
+fn changed_sequences<'a>(
+	managed: &[ManagedEntityRecord],
+	desired: &'a [CatalogEntity],
+	overwritten: &BTreeSet<String>,
+) -> Vec<&'a CatalogEntity> {
+	let previous: BTreeMap<EntityKey, &str> = managed
+		.iter()
+		.filter(|record| record.entity.kind == EntityKind::Sequence)
+		.map(|record| (record.entity.key(), record.entity.statement_hash.as_str()))
+		.collect();
+	desired
+		.iter()
+		.filter(|entity| entity.kind == EntityKind::Sequence && !overwritten.contains(&entity.name))
+		.filter(|entity| {
+			previous.get(&entity.key()).is_some_and(|hash| *hash != entity.statement_hash)
+		})
+		.collect()
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -663,10 +829,6 @@ fn parse_bool(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
 	use std::fs;
-
-	use surrealdb::engine::any::connect;
-	use surrealdb::opt::Config;
-	use surrealdb::opt::capabilities::Capabilities;
 
 	use super::*;
 
@@ -696,11 +858,10 @@ mod tests {
 			..SyncOpts::default()
 		};
 
-		let cfg = Config::new().capabilities(Capabilities::all());
-		let db = connect(("mem://", cfg)).await.expect("connect mem");
-		db.use_ns("watch_layout").use_db("watch_layout").await.expect("select namespace");
-		let files = collect_filesystem_schema_files(&schema_dir, layout.module(), false)
-			.expect("preflight custom path");
+		let db = crate::test_db::fresh("watch_layout").await;
+		let files =
+			collect_filesystem_schema_files(layout.folder(), &schema_dir, layout.module(), false)
+				.expect("preflight custom path");
 		run_sync_with_filesystem_sources(&db, opts.clone(), &layout, &files)
 			.await
 			.expect("initial custom-path sync");
@@ -717,5 +878,273 @@ mod tests {
 		let info: Option<serde_json::Value> = response.take(0).expect("take database info");
 		let tables = info.as_ref().and_then(|value| value.get("tables")).expect("tables");
 		assert!(tables.get("after_refresh").is_some(), "refresh read the wrong layout: {tables}");
+	}
+
+	async fn mem() -> Surreal<Any> {
+		crate::test_db::fresh("sync_test").await
+	}
+
+	/// A filesystem project with one schema file, and a sync over it.
+	struct Project {
+		_temp: tempfile::TempDir,
+		layout: Layout,
+		file: std::path::PathBuf,
+		opts: SyncOpts,
+	}
+
+	impl Project {
+		fn new(sql: &str) -> Self {
+			let temp = tempfile::TempDir::new().expect("tempdir");
+			let folder = temp.path().join("database").to_string_lossy().into_owned();
+			let layout = Layout::new(folder.clone(), Module::default_module());
+			fs::create_dir_all(layout.schema_dir()).expect("schema dir");
+			let file = layout.schema_dir().join("main.surql");
+			fs::write(&file, sql).expect("schema");
+			let opts = SyncOpts {
+				folder,
+				module: Module::default_module(),
+				prune: true,
+				fail_fast: true,
+				..SyncOpts::default()
+			};
+			Self {
+				_temp: temp,
+				layout,
+				file,
+				opts,
+			}
+		}
+
+		fn write(&self, sql: &str) {
+			fs::write(&self.file, sql).expect("schema");
+		}
+
+		async fn sync(&self, db: &Surreal<Any>) -> Result<()> {
+			let files = collect_filesystem_schema_files(
+				self.layout.folder(),
+				&self.layout.schema_dir(),
+				self.layout.module(),
+				true,
+			)?;
+			run_sync_with_filesystem_sources(db, self.opts.clone(), &self.layout, &files).await
+		}
+	}
+
+	async fn next_id(db: &Surreal<Any>) -> i64 {
+		let mut res =
+			db.query("RETURN sequence::nextval('order_no');").await.unwrap().check().unwrap();
+		let value: Option<i64> = res.take(0).unwrap();
+		value.expect("nextval")
+	}
+
+	async fn tables(db: &Surreal<Any>) -> Vec<String> {
+		let mut response = db.query("INFO FOR DB;").await.expect("database info");
+		let info: Option<serde_json::Value> = response.take(0).expect("take database info");
+		let mut names: Vec<String> = info
+			.and_then(|v| {
+				v.get("tables").and_then(|t| t.as_object()).map(|t| t.keys().cloned().collect())
+			})
+			.unwrap_or_default();
+		names.retain(|name: &String| !name.starts_with("__"));
+		names.sort();
+		names
+	}
+
+	#[tokio::test]
+	async fn a_resync_does_not_rewind_a_sequence() {
+		// #93. Before, the re-sync sent `DEFINE SEQUENCE OVERWRITE order_no ...`,
+		// which SurrealDB 3.3 answers by putting the counter back to START.
+		let db = mem().await;
+		let project = Project::new("DEFINE SEQUENCE order_no BATCH 1 START 1;\n");
+		project.sync(&db).await.expect("first sync");
+		assert_eq!([next_id(&db).await, next_id(&db).await, next_id(&db).await], [1, 2, 3]);
+
+		project
+			.write("DEFINE SEQUENCE order_no BATCH 1 START 1;\nDEFINE TABLE invoice SCHEMALESS;\n");
+		project.sync(&db).await.expect("re-sync");
+		assert_eq!(next_id(&db).await, 4, "the re-sync rewound the sequence");
+
+		// An explicit IF NOT EXISTS is left alone too.
+		project.write("DEFINE SEQUENCE IF NOT EXISTS order_no BATCH 1 START 1;\n");
+		project.sync(&db).await.expect("re-sync");
+		assert_eq!(next_id(&db).await, 5);
+	}
+
+	#[tokio::test]
+	async fn an_explicit_sequence_overwrite_still_repositions_it() {
+		// The control for the test above: this engine really does rewind on
+		// OVERWRITE, so a passing re-sync test is not an accident of the engine.
+		let db = mem().await;
+		let project = Project::new("DEFINE SEQUENCE order_no BATCH 1 START 1;\n");
+		project.sync(&db).await.expect("first sync");
+		assert_eq!(next_id(&db).await, 1);
+
+		project.write("DEFINE SEQUENCE OVERWRITE order_no BATCH 1 START 500;\n");
+		project.sync(&db).await.expect("re-sync");
+		// 3.3 drops the node's cached batch, so the rewind is immediate. 3.2 keeps
+		// handing out the cached batch until a restart, which is why #93 only
+		// showed up after one there; the restart case is in the e2e scenarios.
+		let version = db.version().await.expect("server version");
+		if (version.major, version.minor) >= (3, 3) {
+			assert_eq!(next_id(&db).await, 500);
+		}
+	}
+
+	#[tokio::test]
+	async fn a_file_that_does_not_scan_is_neither_applied_nor_pruned() {
+		// The old splitter glued `DEFINE TABLE b` into the unterminated string, lost
+		// it from the catalog, applied the file, and pruned table b.
+		let db = mem().await;
+		let project = Project::new("DEFINE TABLE a SCHEMALESS;\nDEFINE TABLE b SCHEMALESS;\n");
+		project.sync(&db).await.expect("first sync");
+		db.query("CREATE b:keep SET n = 1;").await.unwrap().check().unwrap();
+
+		project.write("DEFINE TABLE a SCHEMALESS;\nDEFINE PARAM $x VALUE 'oops;\nDEFINE TABLE b SCHEMALESS;\nDEFINE TABLE c;\n");
+		let err = project.sync(&db).await.expect_err("an unterminated string must stop the sync");
+		assert!(format!("{err:#}").contains("line 2, column 23"), "{err:#}");
+
+		assert_eq!(tables(&db).await, vec!["a", "b"]);
+		let mut res = db.query("SELECT VALUE n FROM b:keep;").await.unwrap();
+		let kept: Vec<i64> = res.take(0).unwrap();
+		assert_eq!(kept, vec![1], "the data in b must survive");
+	}
+
+	#[tokio::test]
+	async fn the_92_regex_param_syncs_and_resyncs_without_pruning() {
+		let db = mem().await;
+		let sql = "DEFINE PARAM OVERWRITE $PRE_FILTER VALUE /[ \\-_().,\\\\\\/$&+,:;=?@#|'<>^*%!]/;\n\
+			DEFINE FUNCTION OVERWRITE fn::preFilter($str: option<string>) {\n\
+			\tRETURN IF $str { string::replace($str, $PRE_FILTER, '') };\n\
+			};\n\
+			DEFINE TABLE after SCHEMALESS;\n";
+		let project = Project::new(sql);
+		project.sync(&db).await.expect("the #92 file must sync");
+		let mut res =
+			db.query("RETURN fn::preFilter('a-b c#d;e');").await.unwrap().check().unwrap();
+		let cleaned: Option<String> = res.take(0).unwrap();
+		assert_eq!(cleaned.as_deref(), Some("abcde"));
+
+		project.write(&format!("{sql}-- touched\n"));
+		project.sync(&db).await.expect("re-sync");
+		assert_eq!(tables(&db).await, vec!["after"]);
+	}
+
+	#[tokio::test]
+	async fn operations_get_template_variables_on_the_filesystem_path() {
+		// Non-DEFINE statements run as operations, from the unsubstituted file, so
+		// `${X}` reached the server verbatim.
+		let db = mem().await;
+		let mut project = Project::new(
+			"DEFINE TABLE item SCHEMALESS;\nUPSERT item:one SET label = '${LABEL}';\n",
+		);
+		project.opts.allow_all_statements = true;
+		project.opts.vars = TemplateVars {
+			vars: [("LABEL".to_string(), "from-vars".to_string())].into(),
+		};
+		project.sync(&db).await.expect("sync");
+		let mut res = db.query("SELECT VALUE label FROM item:one;").await.unwrap();
+		let labels: Vec<String> = res.take(0).unwrap();
+		assert_eq!(labels, vec!["from-vars"]);
+	}
+
+	#[tokio::test]
+	async fn embedded_sync_substitutes_once() {
+		// The escape `$${KEEP}` must reach the database as the literal `${KEEP}`.
+		// Substituting twice turned it into `${KEEP}` and then failed on it.
+		static FILES: &[EmbeddedSchemaFile] = &[EmbeddedSchemaFile {
+			path: "schema/escape.surql",
+			sql: "DEFINE PARAM $literal VALUE '$${KEEP}';\nDEFINE PARAM $real VALUE '${REAL}';\n",
+		}];
+		let db = mem().await;
+		Sync::embedded(FILES)
+			.vars(TemplateVars {
+				vars: [("REAL".to_string(), "yes".to_string())].into(),
+			})
+			.run(&db)
+			.await
+			.expect("embedded sync");
+		let mut res = db.query("RETURN [$literal, $real];").await.unwrap().check().unwrap();
+		let values: Vec<String> = res.take(0).unwrap();
+		assert_eq!(values, vec!["${KEEP}".to_string(), "yes".to_string()]);
+	}
+
+	#[test]
+	fn changed_sequences_skips_unchanged_new_and_explicitly_overwritten_ones() {
+		let entity = |name: &str, hash: &str| CatalogEntity {
+			kind: EntityKind::Sequence,
+			scope: None,
+			name: name.to_string(),
+			source_path: "schema/s.surql".to_string(),
+			statement_hash: hash.to_string(),
+			file_hash: "f".to_string(),
+		};
+		let managed: Vec<ManagedEntityRecord> =
+			[entity("same", "1"), entity("changed", "1"), entity("forced", "1")]
+				.into_iter()
+				.map(|entity| ManagedEntityRecord {
+					entity,
+					active_rollout_id: None,
+					state: "active".to_string(),
+				})
+				.collect();
+		let desired = vec![
+			entity("same", "1"),
+			entity("changed", "2"),
+			entity("forced", "2"),
+			entity("new", "9"),
+		];
+		let overwritten = BTreeSet::from(["forced".to_string()]);
+		let changed: Vec<&str> = changed_sequences(&managed, &desired, &overwritten)
+			.iter()
+			.map(|e| e.name.as_str())
+			.collect();
+		assert_eq!(changed, vec!["changed"]);
+	}
+
+	#[tokio::test]
+	async fn sync_regenerates_typescript_at_the_configured_file() {
+		let db = mem().await;
+		let mut project =
+			Project::new("DEFINE TABLE item SCHEMAFULL;\nDEFINE FIELD name ON item TYPE string;\n");
+		let ts_file = project.layout.schema_dir().join("../types/database.ts");
+		project.opts.typegen_ts_out = Some(ts_file.clone());
+		project.sync(&db).await.expect("sync");
+		let ts = fs::read_to_string(&ts_file).expect("typegen wrote the named file");
+		assert!(ts.contains("export interface Item {"), "{ts}");
+		assert!(!ts_file.with_file_name("index.ts").exists());
+
+		// Deleted, it comes back on the next sync even with nothing to apply.
+		fs::remove_file(&ts_file).unwrap();
+		project.sync(&db).await.expect("idle sync");
+		assert!(ts_file.exists());
+	}
+
+	#[tokio::test]
+	async fn sync_writes_schema_json_at_the_configured_file() {
+		let db = mem().await;
+		let mut project =
+			Project::new("DEFINE TABLE item SCHEMAFULL;\nDEFINE FIELD name ON item TYPE string;\n");
+		let types_dir = project.layout.schema_dir().join("../types");
+		let json_file = types_dir.join("schema.json");
+		let ts_file = types_dir.join("database.ts");
+		project.opts.typegen_json_out = Some(json_file.clone());
+		project.opts.typegen_ts_out = Some(ts_file.clone());
+		project.sync(&db).await.expect("sync");
+
+		let json: serde_json::Value =
+			serde_json::from_str(&fs::read_to_string(&json_file).expect("typegen wrote the JSON"))
+				.expect("valid JSON");
+		assert!(json["tables"].as_array().unwrap().iter().any(|t| t["name"] == "item"), "{json}");
+		assert!(json["namespace"].as_str().is_some_and(|ns| !ns.is_empty()), "{json}");
+		assert!(json["database"].as_str().is_some_and(|db| !db.is_empty()), "{json}");
+		assert!(ts_file.exists(), "both outputs are written");
+
+		// Either file going missing regenerates it on an idle sync.
+		fs::remove_file(&json_file).unwrap();
+		project.sync(&db).await.expect("idle sync");
+		assert!(json_file.exists());
+		fs::remove_file(&ts_file).unwrap();
+		project.sync(&db).await.expect("idle sync");
+		assert!(ts_file.exists());
 	}
 }

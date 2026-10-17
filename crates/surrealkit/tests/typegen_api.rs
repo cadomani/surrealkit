@@ -119,6 +119,16 @@ async fn generate_captures_all_elements() {
 }
 
 #[tokio::test]
+async fn generate_reports_the_session_namespace_and_database() {
+	let db = mem_db().await;
+	define_schema(&db).await;
+
+	let doc = generate(&db).await.expect("generate");
+	assert_eq!(doc.namespace.as_deref(), Some("surrealkit_test"));
+	assert_eq!(doc.database.as_deref(), Some("typegen_test"));
+}
+
+#[tokio::test]
 async fn run_typegen_writes_valid_json_file() {
 	let db = mem_db().await;
 	define_schema(&db).await;
@@ -129,8 +139,6 @@ async fn run_typegen_writes_valid_json_file() {
 	run_typegen(
 		&db,
 		"./database",
-		"surrealkit_test",
-		"typegen_test",
 		TypegenOpts {
 			out: Some(out.clone()),
 			stdout: false,
@@ -187,8 +195,6 @@ async fn run_typegen_writes_typescript_file_when_configured() {
 	run_typegen(
 		&db,
 		"./database",
-		"surrealkit_test",
-		"typegen_test",
 		TypegenOpts {
 			out: Some(json_out.clone()),
 			stdout: false,
@@ -205,6 +211,45 @@ async fn run_typegen_writes_typescript_file_when_configured() {
 	let ts = std::fs::read_to_string(ts_dir.join("index.ts")).expect("read index.ts");
 	assert!(ts.contains("export interface User {"), "got:\n{ts}");
 	assert!(ts.contains("id: RecordId<'user', string>;"), "got:\n{ts}");
+}
+
+#[tokio::test]
+async fn run_typegen_writes_to_a_named_typescript_file() {
+	// #75: a project that keeps `index.ts` as its own barrel names the generated
+	// file instead.
+	let db = mem_db().await;
+	define_schema(&db).await;
+	let tmp = tempfile::TempDir::new().expect("temp dir");
+	let ts_file = tmp.path().join("libs/database/types/database.ts");
+	run_typegen(
+		&db,
+		"./database",
+		TypegenOpts {
+			out: Some(tmp.path().join("schema.json")),
+			stdout: false,
+			pretty: true,
+			ts_out: Some(ts_file.clone()),
+			ts_format: None,
+		},
+	)
+	.await
+	.expect("run_typegen");
+	let ts = std::fs::read_to_string(&ts_file).expect("read the named file");
+	assert!(ts.contains("export interface User {"), "got:\n{ts}");
+	assert!(
+		!tmp.path().join("libs/database/types/index.ts").exists(),
+		"index.ts must be left to the project"
+	);
+}
+
+#[test]
+fn the_typescript_file_follows_the_configured_path() {
+	use std::path::Path;
+	use surrealkit::typegen::typescript_file;
+	assert_eq!(typescript_file(Path::new("types")), Path::new("types/index.ts"));
+	assert_eq!(typescript_file(Path::new("types/db.ts")), Path::new("types/db.ts"));
+	assert_eq!(typescript_file(Path::new("types/db.mts")), Path::new("types/db.mts"));
+	assert_eq!(typescript_file(Path::new("types/v1.2")), Path::new("types/v1.2/index.ts"));
 }
 
 #[test]
