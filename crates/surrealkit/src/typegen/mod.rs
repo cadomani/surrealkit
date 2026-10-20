@@ -74,7 +74,11 @@ pub fn write_json(doc: &SchemaTypes, path: &std::path::Path, pretty: bool) -> Re
 
 /// Write the TypeScript types for `doc` to [`typescript_file`]`(out)`, creating
 /// its directory if needed. Returns the path written.
-pub fn write_typescript(doc: &SchemaTypes, out: &std::path::Path, cfg: &TypegenTsConfig) -> Result<PathBuf> {
+pub fn write_typescript(
+	doc: &SchemaTypes,
+	out: &std::path::Path,
+	cfg: &TypegenTsConfig,
+) -> Result<PathBuf> {
 	let ts = emit::to_typescript(doc, cfg)?;
 	let path = typescript_file(out);
 	if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
@@ -93,7 +97,7 @@ pub fn write_typescript_formatted(
 	format: Option<&str>,
 	ts_opts: &TypegenTsConfig,
 ) -> Result<PathBuf> {
-	let path = write_typescript(doc, dir, ts_opts)?;
+	let path = write_typescript(doc, out, ts_opts)?;
 	if let Some(cmd) = format {
 		format_file(cmd, &path);
 	}
