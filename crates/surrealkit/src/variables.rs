@@ -139,33 +139,50 @@ struct ProjectConfig {
 	typegen: TypegenConfig,
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq, Hash)]
+/// An optional extra in the generated TypeScript, listed in
+/// `[typegen.ts_opts] emit`.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum EmitType {
+	/// Also export each union's values as an `as const` array.
 	Consts,
+	/// A union of every table name (`$TableName`).
 	TableNames,
+	/// An interface from each table name to its interface (`$TableMap`).
+	/// Implies `table_names`.
 	TableMap,
+	/// An interface from each table name to its fields that have a `DEFAULT`
+	/// (`$TableDefault`).
 	TableDefaults,
+	/// A named type for each field whose type is a union of string literals.
 	StringUnions,
 }
 
+/// The `[typegen.ts_opts.overrides]` section: names for the table-level types.
 #[derive(Debug, Deserialize, Clone, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EmitOverrides {
+	/// Replaces `$TableName`.
 	pub table_names: Option<String>,
+	/// Replaces `$TableDefault`.
 	pub table_defaults: Option<String>,
+	/// Replaces `$TableMap`.
 	pub table_map: Option<String>,
-	pub field_sep: Option<String>,
-	pub types: Option<HashMap<String, String>>,
 }
 
+/// The `[typegen.ts_opts]` section: optional extras in the generated TypeScript.
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypegenTsConfig {
-	pub emit: Option<HashSet<EmitType>>,
-	pub overrides: Option<EmitOverrides>,
+	#[serde(default)]
+	pub emit: HashSet<EmitType>,
+	#[serde(default)]
+	pub overrides: EmitOverrides,
 }
 
 /// The `[typegen]` section of `surrealkit.toml`.
 #[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypegenConfig {
 	/// Where generated TypeScript types go. When set, TS generation is enabled:
 	/// `surrealkit typegen` and `sync --watch` write them here. A path ending in
@@ -180,7 +197,9 @@ pub struct TypegenConfig {
 	/// The generated file path is appended as the final argument. Failures are
 	/// non-fatal warnings.
 	pub format: Option<String>,
-	pub ts_opts: Option<TypegenTsConfig>,
+	/// Optional extras in the generated TypeScript (`[typegen.ts_opts]`).
+	#[serde(default)]
+	pub ts_opts: TypegenTsConfig,
 	/// Where the JSON schema document goes. When set, `sync` writes it after
 	/// applying schema changes, and `surrealkit typegen` writes it there instead
 	/// of `{folder}/types/schema.json` (`--out` still wins). A path ending in
@@ -534,13 +553,41 @@ mod tests {
 		assert_eq!(parsed.format.as_deref(), Some("biome check --write"));
 	}
 
+	#[test]
+	fn load_typegen_config_reads_ts_opts() {
+		let tmp = TempDir::new().unwrap();
+		let cfg = tmp.path().join("surrealkit.toml");
+		std::fs::write(
+			&cfg,
+			"[typegen.ts_opts]\nemit = [\"string_unions\", \"table_map\"]\n\n[typegen.ts_opts.overrides]\ntable_map = \"Tables\"\n",
+		)
+		.unwrap();
+		let parsed = load_typegen_config(Some(&cfg)).unwrap();
+		assert_eq!(
+			parsed.ts_opts.emit,
+			HashSet::from([EmitType::StringUnions, EmitType::TableMap])
+		);
+		assert_eq!(parsed.ts_opts.overrides.table_map.as_deref(), Some("Tables"));
+	}
+
+	#[test_case::test_case("[typegen]\nemit = [\"table_map\"]\n" ; "ts_opts key under typegen")]
+	#[test_case::test_case("[typegen.ts_opts]\nemmit = [\"table_map\"]\n" ; "typo in ts_opts")]
+	#[test_case::test_case("[typegen.ts_opts.overrides]\nfield_sep = \"_\"\n" ; "unknown override")]
+	fn load_typegen_config_rejects_unknown_keys(toml: &str) {
+		let tmp = TempDir::new().unwrap();
+		let cfg = tmp.path().join("surrealkit.toml");
+		std::fs::write(&cfg, toml).unwrap();
+		let err = load_typegen_config(Some(&cfg)).unwrap_err().to_string();
+		assert!(err.contains("unknown field"), "{err}");
+	}
+
 	fn typegen(typescript: Option<&str>, filename: Option<&str>) -> TypegenConfig {
 		TypegenConfig {
 			typescript: typescript.map(PathBuf::from),
 			filename: filename.map(str::to_string),
 			format: None,
 			json: None,
-			ts_opts: None
+			ts_opts: TypegenTsConfig::default(),
 		}
 	}
 

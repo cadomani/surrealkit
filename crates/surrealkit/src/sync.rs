@@ -56,9 +56,9 @@ pub struct SyncOpts {
 	/// Optional formatter command (`[typegen] format`) run on the regenerated
 	/// TypeScript file.
 	pub typegen_ts_format: Option<String>,
-	/// Optional flag to emit a union of table names, and a mapping of table names to their types.
-	/// Configured via `[typegen] emit` in `surrealkit.toml`.
-	pub typegen_ts_opts: Option<TypegenTsConfig>,
+	/// Optional extras in the regenerated TypeScript, configured via
+	/// `[typegen.ts_opts]` in `surrealkit.toml`.
+	pub typegen_ts_opts: TypegenTsConfig,
 	/// When set (via `[typegen] json` in `surrealkit.toml`), write the JSON
 	/// schema document to this file after applying schema changes.
 	pub typegen_json_out: Option<std::path::PathBuf>,
@@ -124,6 +124,7 @@ pub async fn run_sync_with_filesystem_sources(
 ) -> Result<()> {
 	run_setup(db, layout.folder()).await?;
 	ensure_local_state_dirs_for(layout)?;
+
 	if opts.watch {
 		run_sync_with_files(db, &opts, layout, files, true, Substituted::No).await?;
 		log::info!(
@@ -283,7 +284,7 @@ impl<'a> Sync<'a> {
 			folder: String::new(),
 			typegen_ts_out: None,
 			typegen_ts_format: None,
-			typegen_ts_opts: None,
+			typegen_ts_opts: TypegenTsConfig::default(),
 			typegen_json_out: None,
 		};
 		sync_embedded(db, self.files, &opts).await
@@ -615,8 +616,8 @@ async fn run_sync_with_files(
 							&doc,
 							ts_path,
 							opts.typegen_ts_format.as_deref(),
-							&opts.typegen_ts_opts.clone().unwrap_or_default(),
-				) {
+							&opts.typegen_ts_opts,
+						) {
 							Ok(path) => log::info!("typegen: wrote {}", path.display()),
 							Err(err) => log::error!("typegen: failed to write types: {err:#}"),
 						}

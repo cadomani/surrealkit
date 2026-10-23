@@ -394,6 +394,32 @@ With `typescript` or `json` set, `surrealkit sync` regenerates them after
 applying schema changes, so the generated types never drift from the database.
 Use `json` when you generate your own types from the schema document.
 
+Each table becomes an interface with a typed `id`. When the table defines an
+`id` field, its type becomes the id's value type (`RecordId<'user', Uuid>`), and
+record links to that table use it too. Extra output is opt-in:
+
+```toml
+[typegen.ts_opts]
+emit = ["string_unions", "consts", "table_names", "table_map", "table_defaults"]
+
+# Optional: rename the table-level types.
+[typegen.ts_opts.overrides]
+table_names = "TableName"       # default: $TableName
+table_map = "TableMap"          # default: $TableMap
+table_defaults = "TableDefault" # default: $TableDefault
+```
+
+| `emit` | Generates |
+| --- | --- |
+| `string_unions` | A named type for each field whose type is a union of string literals: `role: 'admin' \| 'guest'` on `user` becomes `export type UserRole = "admin" \| "guest"`. A name already used by a table interface or another union keeps the field's union inline, with a warning. |
+| `consts` | With `string_unions`, `table_names` or `table_defaults`, also exports the values at runtime: `export const USER_ROLE_VALUES = ["admin", "guest"] as const`. |
+| `table_names` | `$TableName`, a union of every table name. |
+| `table_map` | `$TableMap`, an interface from each table name to its interface. Implies `table_names`. |
+| `table_defaults` | `$TableDefault`, an interface from each table name to the names of its fields that have a `DEFAULT`. |
+
+Unknown keys under `[typegen]` are rejected, so a typo fails loudly instead of
+being ignored.
+
 ## Vite Plugin
 
 [`vite-plugin-surrealkit`](packages/vite-plugin-surrealkit) runs `surrealkit sync`

@@ -145,7 +145,7 @@ async fn run_typegen_writes_valid_json_file() {
 			pretty: true,
 			ts_out: None,
 			ts_format: None,
-			ts_opts: None,
+			ts_opts: TypegenTsConfig::default(),
 		},
 	)
 	.await
@@ -170,17 +170,52 @@ async fn render_typescript_emits_sdk_interfaces() {
 
 	// PascalCase interface + synthesized typed id.
 	assert!(ts.contains("export interface User {"), "got:\n{ts}");
-	assert!(ts.contains("id: RecordId<'user', string>;"), "got:\n{ts}");
+	assert!(ts.contains("id: RecordId<'user'>;"), "got:\n{ts}");
 	// Field mappings from the introspected schema.
 	assert!(ts.contains("name: string;"), "got:\n{ts}");
 	assert!(ts.contains("nickname?: string;"), "got:\n{ts}");
 	assert!(ts.contains("tags: string[];"), "got:\n{ts}");
-	assert!(ts.contains("best_friend: RecordId<'user', string>;"), "got:\n{ts}");
+	assert!(ts.contains("best_friend: RecordId<'user'>;"), "got:\n{ts}");
 	// Dotted sub-field becomes a nested object property.
 	assert!(ts.contains("address: {"), "got:\n{ts}");
 	assert!(ts.contains("city: string;"), "got:\n{ts}");
 	// SDK import line.
 	assert!(ts.contains("import type { RecordId } from 'surrealdb';"), "got:\n{ts}");
+}
+
+#[tokio::test]
+async fn render_typescript_applies_ts_opts_to_an_introspected_schema() {
+	let db = mem_db().await;
+	let sql = r#"
+		DEFINE TABLE user SCHEMAFULL;
+		DEFINE FIELD id ON user TYPE uuid;
+		DEFINE FIELD role ON user TYPE 'admin' | 'editor' | 'guest' DEFAULT 'guest';
+		DEFINE FIELD addresses ON user TYPE array<object>;
+		DEFINE FIELD addresses.*.label ON user TYPE 'billing' | 'shipping';
+		DEFINE FIELD tags ON user TYPE array<'a' | 'b'>;
+		DEFINE FIELD meta ON user TYPE { "my key": string, flag: option<bool> };
+		DEFINE TABLE `blog-post` SCHEMAFULL;
+		DEFINE FIELD author ON `blog-post` TYPE record<user>;
+	"#;
+	db.query(sql).await.expect("define schema").check().expect("schema ok");
+	let doc = generate(&db).await.expect("generate");
+	let cfg: TypegenTsConfig =
+		toml::from_str("emit = ['string_unions', 'consts', 'table_map', 'table_defaults']")
+			.expect("ts_opts");
+	let ts = render_typescript(&doc, &cfg).expect("render ts");
+
+	assert!(ts.contains("id: RecordId<'user', Uuid>;"), "got:\n{ts}");
+	assert!(ts.contains("author: RecordId<'user', Uuid>;"), "got:\n{ts}");
+	assert!(ts.contains("role: UserRole;"), "got:\n{ts}");
+	assert!(
+		ts.contains(r#"export const USER_ROLE_VALUES = ["admin", "editor", "guest"] as const;"#),
+		"got:\n{ts}"
+	);
+	assert!(ts.contains("label: UserAddressesLabel;"), "got:\n{ts}");
+	assert!(ts.contains(r#"tags: ("a" | "b")[];"#), "got:\n{ts}");
+	assert!(ts.contains(r#"meta: { flag?: boolean; "my key": string };"#), "got:\n{ts}");
+	assert!(ts.contains(r#"  "blog-post": BlogPost;"#), "got:\n{ts}");
+	assert!(ts.contains(r#"  user: ["role"],"#), "got:\n{ts}");
 }
 
 #[tokio::test]
@@ -201,7 +236,7 @@ async fn run_typegen_writes_typescript_file_when_configured() {
 			pretty: true,
 			ts_out: Some(ts_dir.clone()),
 			ts_format: None,
-			ts_opts: None,
+			ts_opts: TypegenTsConfig::default(),
 		},
 	)
 	.await
@@ -210,7 +245,7 @@ async fn run_typegen_writes_typescript_file_when_configured() {
 	assert!(json_out.exists(), "json should still be written");
 	let ts = std::fs::read_to_string(ts_dir.join("index.ts")).expect("read index.ts");
 	assert!(ts.contains("export interface User {"), "got:\n{ts}");
-	assert!(ts.contains("id: RecordId<'user', string>;"), "got:\n{ts}");
+	assert!(ts.contains("id: RecordId<'user'>;"), "got:\n{ts}");
 }
 
 #[tokio::test]
@@ -230,6 +265,7 @@ async fn run_typegen_writes_to_a_named_typescript_file() {
 			pretty: true,
 			ts_out: Some(ts_file.clone()),
 			ts_format: None,
+			ts_opts: TypegenTsConfig::default(),
 		},
 	)
 	.await

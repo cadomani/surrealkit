@@ -43,7 +43,9 @@ pub struct TypegenOpts {
 	/// Optional formatter command run on the generated TypeScript file after writing.
 	/// Configured via `[typegen] format` in `surrealkit.toml`.
 	pub ts_format: Option<String>,
-	pub ts_opts: Option<TypegenTsConfig>,
+	/// Optional extras in the generated TypeScript.
+	/// Configured via `[typegen.ts_opts]` in `surrealkit.toml`.
+	pub ts_opts: TypegenTsConfig,
 }
 
 /// Render a [`SchemaTypes`] document as TypeScript. Re-exported so callers
@@ -154,13 +156,9 @@ pub async fn run_typegen(db: &Surreal<Any>, folder: &str, opts: TypegenOpts) -> 
 	write_json(&doc, &path, opts.pretty)?;
 	log::info!("typegen: wrote {}", path.display());
 
-	if let Some(ts_dir) = &opts.ts_out {
-		let ts_path = write_typescript_formatted(
-			&doc,
-			ts_dir,
-			opts.ts_format.as_deref(),
-			&opts.ts_opts.unwrap_or_default(),
-		)?;
+	if let Some(ts_out) = &opts.ts_out {
+		let ts_path =
+			write_typescript_formatted(&doc, ts_out, opts.ts_format.as_deref(), &opts.ts_opts)?;
 		log::info!("typegen: wrote {}", ts_path.display());
 	}
 	Ok(())

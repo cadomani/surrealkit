@@ -1,232 +1,59 @@
-use std::collections::{HashMap, HashSet};
+//! Named string-literal union types for the TypeScript emitter, enabled via
+//! `[typegen.ts_opts] emit`.
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::typegen::FieldType;
+use super::types::FieldType;
 
-/// Wraps a string in double quotes
-/// Used for printing strings in typescript files
-macro_rules! string_literal {
-	($text: expr) => {
-		format!("\"{}\"", $text)
+/// The members of a union made only of string literals, in declared order and
+/// without duplicates. `None` for any other type.
+pub(super) fn string_union_values(ty: &FieldType) -> Option<Vec<&str>> {
+	let FieldType::Union {
+		variants,
+	} = ty
+	else {
+		return None;
 	};
+	let mut values = Vec::new();
+	for variant in variants {
+		let FieldType::Literal {
+			value: Value::String(s),
+		} = variant
+		else {
+			return None;
+		};
+		if !values.contains(&s.as_str()) {
+			values.push(s.as_str());
+		}
+	}
+	Some(values)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StringUnion {
-	pub name: String,
-	pub items: HashSet<String>,
-	/// Aliases are used for any types encountered while parsing which are structurally identical to this type, but have a different name
-	pub aliases: HashSet<String>,
-	pub export: bool,
-}
-
-impl PartialEq for StringUnion {
-	fn eq(&self, other: &Self) -> bool {
-		self.items == other.items
+/// Render `export type {name} = "a" | "b";`. With `consts`, the values are
+/// also exported as an `as const` array and the type is derived from it.
+pub(super) fn render_union(name: &str, values: &[&str], consts: bool) -> String {
+	if consts {
+		let values_const = const_name(name);
+		return format!(
+			"export const {values_const} = [{}] as const;\nexport type {name} = (typeof {values_const})[number];\n",
+			string_literals(values).join(", "),
+		);
 	}
-}
-
-impl StringUnion {
-	pub fn new(name: &str, export: bool) -> Self {
-		Self {
-			name: name.to_string(),
-			export,
-			items: HashSet::new(),
-			aliases: HashSet::new(),
-		}
-	}
-
-	pub fn add_alias(&mut self, alias_name: &str) {
-		self.aliases.insert(alias_name.to_string());
-	}
-
-	pub fn add(&mut self, item: &str) {
-		self.items.insert(item.to_string());
-	}
-
-	/// Converts the string union to a series of CSV (Comma-separated-values) elements
-	pub fn to_csv(&self) -> String {
-		self.as_literal_strings().join(",")
-	}
-
-	/// Converts the string union to a series of PSV (Pipe-separated-values) elements
-	pub fn to_psv(&self) -> String {
-		self.as_literal_strings().join(" | ")
-	}
-
-	pub fn to_emitted_string(&self, emit_const: bool) -> String {
-		if emit_const {
-			let const_name = self.const_name();
-			let export_str = self.export_as_string();
-			format!(
-				"\n{export} const {const} = [{}] as const;\n{export}type {} = (typeof {const})[number];\n",
-				self.to_csv(),
-				self.name,
-				const=const_name,
-				export=export_str,
-			)
-		} else {
-			format!("\n{}type {} = {};\n", self.export_as_string(), self.name, self.to_psv())
-		}
-	}
-
-	/// Transforms the hashset of `items` into a vector of literal strings.
-	/// Literal strings in this context are strings with double quotes `"` surronding them.
-	#[inline(always)]
-	fn as_literal_strings(&self) -> Vec<String> {
-		self.items.iter().map(|f| string_literal!(f)).collect::<Vec<String>>()
-	}
-
-	#[inline(always)]
-	fn const_name(&self) -> String {
-		format!("{}_VALUES", screaming_snake_case(&self.name))
-	}
-
-	#[inline(always)]
-	fn export_as_string(&self) -> &'static str {
-		if self.export {
-			"export "
-		} else {
-			""
-		}
-	}
-}
-
-#[derive(Debug, Clone)]
-pub struct StringUnionMap {
-	pub map: HashMap<String, StringUnion>,
-	pub export: bool,
-}
-
-impl StringUnionMap {
-	pub fn new(export: bool) -> Self {
-		Self {
-			export,
-			map: HashMap::new(),
-		}
-	}
-
-	pub fn add_to_union(&mut self, union_name: &str, value: &str, export: Option<bool>) {
-		self.map
-			.entry(union_name.to_string())
-			.or_insert_with(|| StringUnion::new(union_name, export.unwrap_or(self.export)))
-			.add(value);
-	}
-
-	pub fn add_union(&mut self, union: &StringUnion) -> String {
-		if let Some(existing) = self.map.get_mut(&union.name) {
-			if *existing != *union {
-				// If a union already exists AND the values are different, panic. This should not happen.
-				panic!(
-					"Duplicate Union name detected: name '{}' is used for differing unions {} and {}",
-					&union.name,
-					self.map
-						.get(&union.name)
-						.unwrap_or(&StringUnion::new(&union.name, true))
-						.to_psv(),
-					union.to_psv(),
-				)
-			}
-			existing.name.clone()
-		} else {
-			if let Some(equiv_union) = self.map.iter_mut().find_map(|(_, v)| {
-				if *v == *union {
-					Some(v)
-				} else {
-					None
-				}
-			}) {
-				equiv_union.add_alias(&union.name);
-				equiv_union.name.clone()
-			} else {
-				self.map.insert(union.name.clone(), union.clone());
-				union.name.clone()
-			}
-		}
-	}
-
-	pub fn get_union(&self, union_name: &str) -> Option<&StringUnion> {
-		let get_result = self.map.get(union_name);
-		match get_result {
-			Some(_) => get_result,
-			// Search for aliases of the given union name
-			None => self.map.iter().find_map(|(_, union)| {
-				if union.aliases.contains(union_name) {
-					Some(union)
-				} else {
-					None
-				}
-			}),
-		}
-	}
-
-	// /// Converts a string union map to a series of typescript type. Extracting any unions into their own type.
-	// pub fn to_ts_extracted(&self, name: &str, emit_const: bool) -> String {}
-
-	/// Converts a string union map into one typescript type.
-	pub fn to_ts(&self, name: &str, emit_const: bool) -> String {
-		let export_str = self.export_as_string();
-		let const_name = screaming_snake_case(&format!("{}_VALUES", name));
-		if emit_const {
-			return format!(
-				"{}const {} = {{\n{}}} as const;\n\n{}type {} = {{\n[K in keyof typeof {}]: (typeof {})[K][number]  \n}};",
-				export_str,
-				const_name,
-				self.map
-					.iter()
-					.map(|(k, v)| format!("  {}: [{}]\n", k, v.to_csv()))
-					.collect::<Vec<String>>()
-					.join(","),
-				export_str,
-				name,
-				const_name,
-				const_name
-			);
-		}
-
-		format!(
-			"{}interface {} {{\n{}}}",
-			export_str,
-			name,
-			self.map
-				.iter()
-				.map(|(k, v)| format!("  {}: {}", k, v.to_psv()))
-				.collect::<Vec<String>>()
-				.join(",\n")
-		)
-	}
-
-	#[inline(always)]
-	fn export_as_string(&self) -> &'static str {
-		if self.export {
-			"export "
-		} else {
-			""
-		}
-	}
-}
-
-/// Convert a table name to a PascalCase interface name (`user` → `User`,
-/// `user_profile` → `UserProfile`).
-pub fn pascal_case(name: &str) -> String {
-	let mut out = String::new();
-	for part in name.split(|c: char| !c.is_ascii_alphanumeric()) {
-		if part.is_empty() {
-			continue;
-		}
-		let mut chars = part.chars();
-		if let Some(first) = chars.next() {
-			out.extend(first.to_uppercase());
-			out.push_str(chars.as_str());
-		}
-	}
-	if out.is_empty() {
-		name.to_string()
+	let ty = if values.is_empty() {
+		"never".to_string()
 	} else {
-		out
-	}
+		string_literals(values).join(" | ")
+	};
+	format!("export type {name} = {ty};\n")
+}
+
+pub(super) fn string_literals(values: &[&str]) -> Vec<String> {
+	values.iter().map(|v| format!("{v:?}")).collect()
+}
+
+/// The `as const` array behind a union type (`UserRole` → `USER_ROLE_VALUES`).
+pub(super) fn const_name(type_name: &str) -> String {
+	format!("{}_VALUES", screaming_snake_case(type_name))
 }
 
 fn is_separator(c: char) -> bool {
@@ -234,7 +61,7 @@ fn is_separator(c: char) -> bool {
 }
 
 /// Convert a string to a screaming snake_case name (`UserInfo` -> `USER_INFO`)
-pub fn screaming_snake_case(name: &str) -> String {
+fn screaming_snake_case(name: &str) -> String {
 	let mut out = String::new();
 	let mut iter = name.chars();
 	let mut can_split = false;
@@ -260,28 +87,7 @@ pub fn screaming_snake_case(name: &str) -> String {
 			capitalized_streak = char.is_ascii_uppercase();
 		}
 	}
-	if out.is_empty() {
-		name.to_string()
-	} else {
-		out
-	}
-}
-
-/// Inspects a FieldType and returns a boolean indicating if the type is a pure string union or not.
-pub fn is_string_union(field_type: &FieldType) -> bool {
-	match field_type {
-		FieldType::Union {
-			variants,
-		} => variants.iter().all(|f| {
-			matches!(
-				f,
-				FieldType::Literal {
-					value: Value::String(_)
-				}
-			)
-		}),
-		_ => false,
-	}
+	out
 }
 
 #[cfg(test)]
@@ -289,13 +95,18 @@ mod tests {
 	use serde_json::json;
 
 	use super::*;
+	use crate::typegen::PrimitiveType;
 
-	#[test]
-	fn pascal_case_variants() {
-		assert_eq!(pascal_case("user"), "User");
-		assert_eq!(pascal_case("user_profile"), "UserProfile");
-		assert_eq!(pascal_case("blog-post"), "BlogPost");
-		assert_eq!(pascal_case("User"), "User");
+	fn lit(value: Value) -> FieldType {
+		FieldType::Literal {
+			value,
+		}
+	}
+
+	fn union(variants: Vec<FieldType>) -> FieldType {
+		FieldType::Union {
+			variants,
+		}
 	}
 
 	#[test]
@@ -309,50 +120,37 @@ mod tests {
 	}
 
 	#[test]
-	fn is_string_union_variants() {
+	fn string_union_values_variants() {
+		let datetime = FieldType::Primitive {
+			name: PrimitiveType::Datetime,
+		};
+		assert_eq!(string_union_values(&datetime), None);
 		assert_eq!(
-			is_string_union(&FieldType::Primitive {
-				name: crate::typegen::PrimitiveType::Datetime
-			}),
-			false
+			string_union_values(&union(vec![
+				lit(json!("USER")),
+				lit(json!("ADMIN")),
+				lit(json!("USER")),
+				lit(json!("GUEST")),
+			])),
+			Some(vec!["USER", "ADMIN", "GUEST"]),
 		);
+		assert_eq!(string_union_values(&union(vec![lit(json!("USER")), lit(json!(200))])), None);
+	}
+
+	#[test]
+	fn render_union_escapes_values() {
 		assert_eq!(
-			is_string_union(&FieldType::Primitive {
-				name: crate::typegen::PrimitiveType::String
-			}),
-			false
+			render_union("Quote", &["say \"hi\"", "plain"], false),
+			"export type Quote = \"say \\\"hi\\\"\" | \"plain\";\n",
 		);
+	}
+
+	#[test]
+	fn render_union_with_consts() {
 		assert_eq!(
-			is_string_union(&FieldType::Union {
-				variants: vec![
-					FieldType::Literal {
-						value: json!("USER")
-					},
-					FieldType::Literal {
-						value: json!("ADMIN")
-					},
-					FieldType::Literal {
-						value: json!("GUEST")
-					}
-				]
-			}),
-			true
-		);
-		assert_eq!(
-			is_string_union(&FieldType::Union {
-				variants: vec![
-					FieldType::Literal {
-						value: json!("USER")
-					},
-					FieldType::Literal {
-						value: json!(200)
-					},
-					FieldType::Literal {
-						value: json!("GUEST")
-					}
-				]
-			}),
-			false
+			render_union("UserRole", &["admin", "guest"], true),
+			"export const USER_ROLE_VALUES = [\"admin\", \"guest\"] as const;\n\
+			 export type UserRole = (typeof USER_ROLE_VALUES)[number];\n",
 		);
 	}
 }

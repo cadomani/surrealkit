@@ -8,9 +8,7 @@
 //! The parser is *total*: anything it does not understand becomes
 //! [`FieldType::Unknown`] rather than panicking or being dropped.
 
-use crate::typegen::ObjectField;
-
-use super::types::{FieldType, PrimitiveType};
+use super::types::{FieldType, ObjectField, PrimitiveType};
 
 /// Clause keywords that terminate the `TYPE` body in a `DEFINE FIELD` statement.
 const TERMINATORS: &[&str] =
@@ -192,52 +190,85 @@ impl Parser {
 		}
 	}
 
+	/// `{ key: type, … }`. SurrealDB quotes keys that are not plain identifiers
+	/// (`{ "my key": string }`), and prints an optional property as `none | T`,
+	/// which is normalised to `option<T>`.
 	fn parse_object_type(&mut self) -> FieldType {
-		//opening braces and skip ws
-		self.pos += 1;
-		self.skip_ws();
-		let mut depth: i32 = 1;
-
-		let mut key_name: Vec<char> = Vec::new();
-		let mut fields: Vec<ObjectField> = Vec::new();
-
-		while let Some(c) = self.peek()
-			&& depth > 0
-		{
-			self.pos += 1;
-			match c {
-				'<' | '(' | '[' | '{' => depth += 1,
-				'>' | ')' | ']' | '}' => {
-					depth -= 1;
+		let start = self.pos;
+		self.pos += 1; // '{'
+		let mut fields = Vec::new();
+		loop {
+			self.skip_ws();
+			match self.peek() {
+				Some('}') => {
+					self.pos += 1;
+					return FieldType::Object {
+						fields,
+					};
 				}
-				':' => {
-					let name = String::from_iter(&key_name);
-					let (ty, is_opt) = unwrap_optional(self.parse_union());
-					let real_type = if is_opt {
-						FieldType::Option {
-							inner: Box::new(ty),
-						}
-					} else {
-						ty
+				Some(',') => self.pos += 1,
+				Some(_) => {
+					let name = self.read_object_key();
+					self.skip_ws();
+					if self.peek() != Some(':') {
+						break;
+					}
+					self.pos += 1; // ':'
+					let r#type = match unwrap_optional(self.parse_union()) {
+						(inner, true) => FieldType::Option {
+							inner: Box::new(inner),
+						},
+						(ty, false) => ty,
 					};
 					fields.push(ObjectField {
 						name,
-						r#type: real_type,
+						r#type,
 					});
-					key_name.clear();
 				}
-				',' => {
-					self.skip_ws();
+				None => break,
+			}
+		}
+		// Malformed or unterminated object.
+		self.pos = start;
+		let source = self.remaining_trimmed();
+		self.pos = self.chars.len();
+		FieldType::Unknown {
+			source,
+		}
+	}
+
+	/// A bare identifier key, or a quoted one with its quotes and escapes removed.
+	fn read_object_key(&mut self) -> String {
+		let mut key = String::new();
+		match self.peek() {
+			Some(quote) if quote == '"' || quote == '\'' || quote == '`' => {
+				self.pos += 1;
+				while let Some(c) = self.peek() {
+					self.pos += 1;
+					if c == quote {
+						break;
+					}
+					if c == '\\' {
+						if let Some(escaped) = self.peek() {
+							self.pos += 1;
+							key.push(escaped);
+						}
+					} else {
+						key.push(c);
+					}
 				}
-				_ => {
-					key_name.push(c);
+			}
+			_ => {
+				while let Some(c) = self.peek() {
+					if !(c.is_alphanumeric() || c == '_') {
+						break;
+					}
+					self.pos += 1;
+					key.push(c);
 				}
 			}
 		}
-
-		FieldType::Object {
-			fields,
-		}
+		key
 	}
 
 	fn remaining_trimmed(&self) -> String {
@@ -833,5 +864,45 @@ mod tests {
 			extract_type_clause("DEFINE FIELD type ON user TYPE 'ADMIN' | 'DEFAULT' | 'GUEST'"),
 			Some("'ADMIN' | 'DEFAULT' | 'GUEST'".to_string())
 		)
+	}
+
+	#[test]
+	fn parses_object_literal_type() {
+		let field = |name: &str, r#type: FieldType| ObjectField {
+			name: name.to_string(),
+			r#type,
+		};
+		assert_eq!(
+			parse_type(r#"{ a : string, "my \"key\"": none | int, c: { d: bool } }"#),
+			FieldType::Object {
+				fields: vec![
+					field("a", prim(PrimitiveType::String)),
+					field(
+						"my \"key\"",
+						FieldType::Option {
+							inner: Box::new(prim(PrimitiveType::Int)),
+						}
+					),
+					field(
+						"c",
+						FieldType::Object {
+							fields: vec![field("d", prim(PrimitiveType::Bool))],
+						}
+					),
+				],
+			}
+		);
+	}
+
+	#[test]
+	fn malformed_object_literal_is_unknown() {
+		for src in ["{ a: string", "{ a string }", "{ \"a: string }"] {
+			assert_eq!(
+				parse_type(src),
+				FieldType::Unknown {
+					source: src.to_string(),
+				}
+			);
+		}
 	}
 }

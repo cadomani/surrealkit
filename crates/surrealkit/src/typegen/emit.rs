@@ -6,20 +6,13 @@
 //!   per table, every table carrying an `id: RecordId<'table'>`, with field types mapped to SDK
 //!   wrapper types.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::Result;
 
-use crate::{
-	typegen::{
-		string_union::{StringUnionMap, pascal_case},
-		type_parser::unwrap_optional,
-		types::{CollectFlags, EmitCollection},
-	},
-	variables::{EmitType, TypegenTsConfig},
-};
-
+use super::string_union::{const_name, render_union, string_literals, string_union_values};
 use super::types::{FieldDef, FieldType, ObjectField, PrimitiveType, SchemaTypes, TableDef};
+use crate::variables::{EmitType, TypegenTsConfig};
 
 pub fn to_json(doc: &SchemaTypes, pretty: bool) -> Result<String> {
 	Ok(if pretty {
@@ -33,103 +26,76 @@ pub fn to_json(doc: &SchemaTypes, pretty: bool) -> Result<String> {
 /// surrealdb JS SDK (v2). Returns the full file contents.
 pub fn to_typescript(doc: &SchemaTypes, cfg: &TypegenTsConfig) -> Result<String> {
 	let mut imports: BTreeSet<&'static str> = BTreeSet::new();
-	// Map of table names to their record Id types (as a string)
 	let mut body = String::new();
 
-	let emit_flags = cfg.emit.clone().unwrap_or_default();
-	let overrides = cfg.overrides.clone().unwrap_or_default();
-
-	let table_union_name = overrides.table_names.unwrap_or("$TableName".to_string());
-	let table_map_name = overrides.table_map.unwrap_or("$TableMap".to_string());
-	let table_default_name = overrides.table_defaults.unwrap_or("$TableDefault".to_string());
-
-	let mut emitting = EmitCollection::new(CollectFlags {
-		collect_defaults: emit_flags.contains(&EmitType::TableDefaults),
-		collect_unions: emit_flags.contains(&EmitType::StringUnions),
-		emit_consts: emit_flags.contains(&EmitType::Consts),
-		emit_table_map: emit_flags.contains(&EmitType::TableMap),
-		emit_table_names: emit_flags.contains(&EmitType::TableNames),
-	}, overrides.field_sep);
-
-	let emit_table_info = emitting.flags.emit_table_map || emitting.flags.emit_table_names;
+	let emits = |kind: EmitType| cfg.emit.contains(&kind);
+	let consts = emits(EmitType::Consts);
+	let table_names_type = cfg.overrides.table_names.as_deref().unwrap_or("$TableName");
+	let table_map_type = cfg.overrides.table_map.as_deref().unwrap_or("$TableMap");
+	let table_defaults_type = cfg.overrides.table_defaults.as_deref().unwrap_or("$TableDefault");
 
 	// Skip SurrealKit's internal bookkeeping tables (`__entity`, `__rollout`,
 	// …) — they are framework state, not user schema.
-	let tables = doc.tables.iter().filter(|t| !t.name.starts_with("__"));
+	let tables: Vec<&TableDef> = doc.tables.iter().filter(|t| !t.name.starts_with("__")).collect();
 
-	let mut string_unions = StringUnionMap::new(true);
-
-	// Loop through all the tables once, extracting any needed data
-	for table in tables.clone() {
-		let mut found_record = false;
-		for field in &table.fields {
-			if field.name == "id" {
-				let ts_type = field_type_to_ts(&field.r#type, &mut imports, &mut emitting, "");
-				emitting.add_record_type(table.name.clone(), ts_type);
-				found_record = true;
-			}
-			// let field_path = aggregate_path(&table.name, &field.name);
-			emitting.add_str_union(&table.name, field);
-			emitting.add_default(&table.name, field);
-		}
-		// Base case, assume it's a string
-		if !found_record {
-			emitting.add_record_type(table.name.clone(), "string".to_string());
-		}
-
-		if emit_table_info {
-			string_unions.add_to_union(
-				&table_union_name,
-				&table.name,
-				Some(emitting.flags.emit_table_names),
-			);
+	let mut lookups = Lookups::default();
+	for table in &tables {
+		if let Some(id) = table.fields.iter().find(|f| f.name == "id") {
+			let ty = field_type_to_ts(&id.r#type, &mut imports, &lookups);
+			lookups.record_ids.insert(table.name.clone(), ty);
 		}
 	}
 
-	for (idx, table) in tables.enumerate() {
+	let mut unions: Vec<(String, Vec<&str>)> = Vec::new();
+	if emits(EmitType::StringUnions) {
+		let mut taken: HashSet<String> = tables.iter().map(|t| pascal_case(&t.name)).collect();
+		taken.extend([table_names_type, table_map_type, table_defaults_type].map(str::to_string));
+		for table in &tables {
+			for field in table.fields.iter().filter(|f| f.name != "id") {
+				let (Some(values), Some(path)) =
+					(string_union_values(&field.r#type), union_path(&field.name))
+				else {
+					continue;
+				};
+				let name = format!("{}{}", pascal_case(&table.name), pascal_case(&field.name));
+				if !taken.insert(name.clone()) {
+					log::warn!(
+						"typegen: `{}.{}` would be named `{name}`, which another type already uses; keeping its union inline",
+						table.name,
+						field.name,
+					);
+					continue;
+				}
+				lookups.unions.insert(format!("{}.{path}", table.name), name.clone());
+				unions.push((name, values));
+			}
+		}
+	}
+
+	for (idx, table) in tables.iter().enumerate() {
 		if idx > 0 {
 			body.push('\n');
 		}
-		render_table(table, &mut body, &mut imports, &mut emitting);
+		render_table(table, &mut body, &mut imports, &lookups);
 	}
 
-	// Print out all the collected unions
-	if let Some(collected_unions) = emitting.unions {
-		collected_unions.map.iter().for_each(|(_, u)| {
-			if !u.items.is_empty() {
-				// If type is empty, don't print it out
-				body.push_str(&u.to_emitted_string(emitting.flags.emit_consts))
-			}
-		});
+	for (name, values) in &unions {
+		body.push('\n');
+		body.push_str(&render_union(name, values, consts));
 	}
-
-	if let Some(default_unions) = emitting.defaults {
-		if emitting.flags.collect_defaults {
-			body.push_str(&format!(
-				"\n{}\n",
-				default_unions.to_ts(&table_default_name, emitting.flags.emit_consts),
-			));
-		}
+	if emits(EmitType::TableDefaults) {
+		body.push('\n');
+		body.push_str(&render_table_defaults(table_defaults_type, &tables, consts));
 	}
-
-	if let Some(table_union) = string_unions.get_union(&table_union_name) {
-		if emit_table_info {
-			// Create union of table names
-			body.push_str(&table_union.to_emitted_string(emitting.flags.emit_consts));
-
-			// Create type map of table names -> typescript interface
-			if emitting.flags.emit_table_map {
-				body.push_str(&format!(
-					"export interface {} extends Record<{}, object> {{\n\n",
-					table_map_name, table_union_name
-				));
-				table_union
-					.items
-					.iter()
-					.for_each(|f| body.push_str(&format!("  {}: {};\n", f, pascal_case(f))));
-				body.push_str("}\n");
-			}
-		}
+	// The table map is keyed by the table-name union, so it needs that too.
+	if emits(EmitType::TableNames) || emits(EmitType::TableMap) {
+		let names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
+		body.push('\n');
+		body.push_str(&render_union(table_names_type, &names, consts));
+	}
+	if emits(EmitType::TableMap) {
+		body.push('\n');
+		body.push_str(&render_table_map(table_map_type, table_names_type, &tables));
 	}
 
 	let mut out = String::new();
@@ -143,33 +109,90 @@ pub fn to_typescript(doc: &SchemaTypes, cfg: &TypegenTsConfig) -> Result<String>
 	Ok(out)
 }
 
+/// Types resolved before rendering tables, so fields can refer to them.
+#[derive(Default)]
+struct Lookups {
+	/// The id value type of each table that defines an `id` field.
+	record_ids: HashMap<String, String>,
+	/// The named union type for a `table.field` path, from `string_unions`.
+	unions: HashMap<String, String>,
+}
+
+/// The `table.field` path a field's named union is registered under, matching
+/// the path [`render_node`] builds while walking the field tree. `None` for
+/// array element entries (`tags.*`, `tags[*]`), whose type renders inside the
+/// array's own type.
+fn union_path(field_name: &str) -> Option<String> {
+	let mut path = Vec::new();
+	let mut element = false;
+	for segment in field_name.split('.').map(str::trim).filter(|s| !s.is_empty()) {
+		let (name, is_array) = strip_array_marker(segment);
+		element = name == "*" || is_array;
+		if name != "*" && !name.is_empty() {
+			path.push(name);
+		}
+	}
+	(!element && !path.is_empty()).then(|| path.join("."))
+}
+
 fn render_table(
 	table: &TableDef,
 	out: &mut String,
 	imports: &mut BTreeSet<&'static str>,
-	collection: &mut EmitCollection,
+	lookups: &Lookups,
 ) {
 	imports.insert("RecordId");
 	out.push_str(&format!("export interface {} {{\n", pascal_case(&table.name)));
 	// Every record has a typed id. The synthesized field wins over any
-	// introspected `id` field (every record id is a RecordId).
-	match collection.record_types.get(&table.name) {
-		Some(t) => out.push_str(&format!("  id: RecordId<'{}', {}>;\n", table.name, t)),
-		None => out.push_str(&format!("  id: RecordId<'{}', string>;\n", table.name)),
+	// introspected `id` field, whose type becomes the id's value type.
+	match lookups.record_ids.get(&table.name) {
+		Some(id) => out.push_str(&format!("  id: RecordId<'{}', {id}>;\n", table.name)),
+		None => out.push_str(&format!("  id: RecordId<'{}'>;\n", table.name)),
 	}
+
 	let tree = build_field_tree(&table.fields);
 	for (name, node) in &tree.children {
-		render_node(
-			name,
-			node,
-			1,
-			out,
-			imports,
-			collection,
-			&collection.aggregate_path(&table.name, name),
-		);
+		render_node(name, node, 1, out, imports, lookups, &format!("{}.{name}", table.name));
 	}
 	out.push_str("}\n");
+}
+
+/// Map each table to the names of its fields that have a `DEFAULT`.
+fn render_table_defaults(name: &str, tables: &[&TableDef], consts: bool) -> String {
+	let defaults = tables.iter().filter_map(|t| {
+		let fields: Vec<&str> =
+			t.fields.iter().filter(|f| f.has_default).map(|f| f.name.as_str()).collect();
+		(!fields.is_empty()).then(|| (format_key(&t.name), string_literals(&fields)))
+	});
+	if consts {
+		let values_const = const_name(name);
+		let mut out = format!("export const {values_const} = {{\n");
+		for (table, fields) in defaults {
+			out.push_str(&format!("  {table}: [{}],\n", fields.join(", ")));
+		}
+		out.push_str(&format!(
+			"}} as const;\nexport type {name} = {{\n  [K in keyof typeof {values_const}]: (typeof {values_const})[K][number];\n}};\n"
+		));
+		out
+	} else {
+		let mut out = format!("export interface {name} {{\n");
+		for (table, fields) in defaults {
+			out.push_str(&format!("  {table}: {};\n", fields.join(" | ")));
+		}
+		out.push_str("}\n");
+		out
+	}
+}
+
+/// Map each table name to its interface.
+fn render_table_map(name: &str, table_names_type: &str, tables: &[&TableDef]) -> String {
+	let mut out =
+		format!("export interface {name} extends Record<{table_names_type}, object> {{\n");
+	for table in tables {
+		out.push_str(&format!("  {}: {};\n", format_key(&table.name), pascal_case(&table.name)));
+	}
+	out.push_str("}\n");
+	out
 }
 
 /// A node in the field tree reconstructed from flattened field paths
@@ -246,8 +269,8 @@ fn render_node(
 	depth: usize,
 	out: &mut String,
 	imports: &mut BTreeSet<&'static str>,
-	collection: &mut EmitCollection,
-	node_path: &str,
+	lookups: &Lookups,
+	path: &str,
 ) {
 	let indent = "  ".repeat(depth);
 	let optional = if node.own_optional {
@@ -256,7 +279,7 @@ fn render_node(
 		""
 	};
 	let key = format_key(name);
-	let ty = render_node_type(node, depth, imports, collection, node_path);
+	let ty = render_node_type(node, depth, imports, lookups, path);
 	out.push_str(&format!("{indent}{key}{optional}: {ty};\n"));
 }
 
@@ -264,8 +287,8 @@ fn render_node_type(
 	node: &Node,
 	depth: usize,
 	imports: &mut BTreeSet<&'static str>,
-	collection: &mut EmitCollection,
-	node_path: &str,
+	lookups: &Lookups,
+	path: &str,
 ) -> String {
 	if !node.children.is_empty() {
 		let inner_indent = "  ".repeat(depth + 1);
@@ -278,13 +301,8 @@ fn render_node_type(
 				""
 			};
 			let key = format_key(name);
-			let ty = render_node_type(
-				child,
-				depth + 1,
-				imports,
-				collection,
-				&collection.aggregate_path(node_path, name),
-			);
+			let ty =
+				render_node_type(child, depth + 1, imports, lookups, &format!("{path}.{name}"));
 			obj.push_str(&format!("{inner_indent}{key}{optional}: {ty};\n"));
 		}
 		obj.push_str(&format!("{close_indent}}}"));
@@ -297,9 +315,12 @@ fn render_node_type(
 			obj
 		}
 	} else if let Some(ty) = &node.own_type {
-		field_type_to_ts(ty, imports, collection, node_path)
+		match lookups.unions.get(path) {
+			Some(union) => union.clone(),
+			None => field_type_to_ts(ty, imports, lookups),
+		}
 	} else if let Some(elem) = &node.elem_type {
-		let inner = field_type_to_ts(elem, imports, collection, node_path);
+		let inner = field_type_to_ts(elem, imports, lookups);
 		wrap_array(&inner)
 	} else {
 		"unknown".to_string()
@@ -311,72 +332,66 @@ fn render_node_type(
 fn field_type_to_ts(
 	ty: &FieldType,
 	imports: &mut BTreeSet<&'static str>,
-	collection: &mut EmitCollection,
-	field_path: &str,
+	lookups: &Lookups,
 ) -> String {
-	if let Some(alias_type) = collection.replacements.get(field_path) {
-		// If this value has been replaced with a type alias, use that instead
-		alias_type.clone()
-	} else {
-		match ty {
-			FieldType::Primitive {
-				name,
-			} => primitive_to_ts(*name, imports),
-			FieldType::Option {
-				inner,
-			} => {
-				format!("{} | undefined", field_type_to_ts(inner, imports, collection, field_path))
-			}
-			FieldType::Array {
-				inner,
-				..
-			}
-			| FieldType::Set {
-				inner,
-				..
-			} => wrap_array(&field_type_to_ts(inner, imports, collection, field_path)),
-			FieldType::Record {
-				tables,
-			} => {
-				imports.insert("RecordId");
-				if tables.is_empty() {
-					"RecordId".to_string()
-				} else {
-					tables
-						.iter()
-						.map(|t| match collection.record_types.get(t) {
-							Some(ty) => format!("RecordId<'{t}', {ty}>"),
-							None => format!("RecordId<'{t}'>"),
-						})
-						.collect::<Vec<_>>()
-						.join(" | ")
-				}
-			}
-			FieldType::Geometry {
-				kinds,
-			} => geometry_to_ts(kinds, imports),
-			FieldType::Literal {
-				value,
-			} => literal_to_ts(value),
-			FieldType::Union {
-				variants,
-			} => variants
-				.iter()
-				.map(|v| field_type_to_ts(v, imports, collection, field_path))
-				.collect::<Vec<_>>()
-				.join(" | "),
-			FieldType::Object {
-				fields,
-			} => object_to_ts(fields, imports, collection, field_path),
-			FieldType::Unknown {
-				..
-			} => "unknown".to_string(),
+	match ty {
+		FieldType::Primitive {
+			name,
+		} => primitive_to_ts(*name, imports),
+		FieldType::Option {
+			inner,
+		} => {
+			format!("{} | undefined", field_type_to_ts(inner, imports, lookups))
 		}
+		FieldType::Array {
+			inner,
+			..
+		}
+		| FieldType::Set {
+			inner,
+			..
+		} => wrap_array(&field_type_to_ts(inner, imports, lookups)),
+		FieldType::Record {
+			tables,
+		} => {
+			imports.insert("RecordId");
+			if tables.is_empty() {
+				"RecordId".to_string()
+			} else {
+				tables
+					.iter()
+					.map(|t| match lookups.record_ids.get(t) {
+						Some(id) => format!("RecordId<'{t}', {id}>"),
+						None => format!("RecordId<'{t}'>"),
+					})
+					.collect::<Vec<_>>()
+					.join(" | ")
+			}
+		}
+		FieldType::Geometry {
+			kinds,
+		} => geometry_to_ts(kinds, imports),
+		FieldType::Literal {
+			value,
+		} => literal_to_ts(value),
+		FieldType::Union {
+			variants,
+		} => variants
+			.iter()
+			.map(|v| field_type_to_ts(v, imports, lookups))
+			.collect::<Vec<_>>()
+			.join(" | "),
+		FieldType::Object {
+			fields,
+		} => object_to_ts(fields, imports, lookups),
+		FieldType::Unknown {
+			..
+		} => "unknown".to_string(),
 	}
 }
 
 fn primitive_to_ts(name: PrimitiveType, imports: &mut BTreeSet<&'static str>) -> String {
-	(match name {
+	match name {
 		PrimitiveType::String => "string",
 		PrimitiveType::Int | PrimitiveType::Float | PrimitiveType::Number => "number",
 		PrimitiveType::Decimal => {
@@ -399,7 +414,7 @@ fn primitive_to_ts(name: PrimitiveType, imports: &mut BTreeSet<&'static str>) ->
 		PrimitiveType::None => "undefined",
 		PrimitiveType::Object => "{ [key: string]: unknown }",
 		PrimitiveType::Function => "unknown",
-	})
+	}
 	.to_string()
 }
 
@@ -431,8 +446,7 @@ fn geometry_to_ts(kinds: &[String], imports: &mut BTreeSet<&'static str>) -> Str
 fn object_to_ts(
 	fields: &[ObjectField],
 	imports: &mut BTreeSet<&'static str>,
-	collection: &mut EmitCollection,
-	field_path: &str,
+	lookups: &Lookups,
 ) -> String {
 	if fields.is_empty() {
 		return "{ [key: string]: unknown }".to_string();
@@ -440,23 +454,14 @@ fn object_to_ts(
 	let inner = fields
 		.iter()
 		.map(|f| {
-			let (ty, is_opt) = unwrap_optional(f.r#type.clone());
-
-			format!(
-				"{}{}: {}",
-				format_key(&f.name),
-				if is_opt {
-					"?"
-				} else {
-					""
-				},
-				field_type_to_ts(
-					&ty,
-					imports,
-					collection,
-					&collection.aggregate_path(field_path, &f.name)
-				)
-			)
+			// The parser normalises an optional property (`none | T`) to `option<T>`.
+			let (optional, ty) = match &f.r#type {
+				FieldType::Option {
+					inner,
+				} => ("?", inner.as_ref()),
+				ty => ("", ty),
+			};
+			format!("{}{optional}: {}", format_key(&f.name), field_type_to_ts(ty, imports, lookups))
 		})
 		.collect::<Vec<_>>()
 		.join("; ");
@@ -507,17 +512,37 @@ fn is_valid_identifier(s: &str) -> bool {
 	let mut chars = s.chars();
 	match chars.next() {
 		Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$' => {}
-		_ => {
-			return false;
-		}
+		_ => return false,
 	}
 	chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Convert a table name to a PascalCase interface name (`user` → `User`,
+/// `user_profile` → `UserProfile`).
+fn pascal_case(name: &str) -> String {
+	let mut out = String::new();
+	for part in name.split(|c: char| !c.is_ascii_alphanumeric()) {
+		if part.is_empty() {
+			continue;
+		}
+		let mut chars = part.chars();
+		if let Some(first) = chars.next() {
+			out.extend(first.to_uppercase());
+			out.push_str(chars.as_str());
+		}
+	}
+	if out.is_empty() {
+		name.to_string()
+	} else {
+		out
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::typegen::types::{FieldType, PrimitiveType};
+	use crate::variables::EmitOverrides;
 
 	fn prim(name: PrimitiveType) -> FieldType {
 		FieldType::Primitive {
@@ -570,12 +595,43 @@ mod tests {
 		}
 	}
 
+	fn emitting(kinds: &[EmitType]) -> TypegenTsConfig {
+		TypegenTsConfig {
+			emit: kinds.iter().copied().collect(),
+			..Default::default()
+		}
+	}
+
+	fn string_union(values: &[&str]) -> FieldType {
+		FieldType::Union {
+			variants: values
+				.iter()
+				.map(|v| FieldType::Literal {
+					value: (*v).into(),
+				})
+				.collect(),
+		}
+	}
+
+	fn with_default(mut field: FieldDef) -> FieldDef {
+		field.has_default = true;
+		field
+	}
+
+	#[test]
+	fn pascal_case_variants() {
+		assert_eq!(pascal_case("user"), "User");
+		assert_eq!(pascal_case("user_profile"), "UserProfile");
+		assert_eq!(pascal_case("blog-post"), "BlogPost");
+		assert_eq!(pascal_case("User"), "User");
+	}
+
 	#[test]
 	fn table_becomes_interface_with_typed_id() {
 		let d = doc(vec![table("user", vec![field("name", prim(PrimitiveType::String), false)])]);
 		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("export interface User {"), "got:\n{ts}");
-		assert!(ts.contains("id: RecordId<'user', string>;"), "got:\n{ts}");
+		assert!(ts.contains("id: RecordId<'user'>;"), "got:\n{ts}");
 		assert!(ts.contains("name: string;"), "got:\n{ts}");
 		assert!(ts.contains("import type { RecordId } from 'surrealdb';"), "got:\n{ts}");
 	}
@@ -733,10 +789,209 @@ mod tests {
 	}
 
 	#[test]
-	fn introspected_id_field_is_not_skipped() {
-		let d = doc(vec![table("user", vec![field("id", prim(PrimitiveType::Uuid), false)])]);
+	fn introspected_id_field_types_the_record_id() {
+		let d = doc(vec![
+			table(
+				"post",
+				vec![field(
+					"author",
+					FieldType::Record {
+						tables: vec!["user".into()],
+					},
+					false,
+				)],
+			),
+			table("user", vec![field("id", prim(PrimitiveType::Uuid), false)]),
+		]);
 		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
 		assert!(ts.contains("id: RecordId<'user', Uuid>;"), "got:\n{ts}");
-		assert!(!ts.contains("id: string;"), "synthesized id must win, got:\n{ts}");
+		assert!(ts.contains("author: RecordId<'user', Uuid>;"), "got:\n{ts}");
+		assert!(ts.contains("id: RecordId<'post'>;"), "got:\n{ts}");
+		assert!(!ts.contains("id: Uuid;"), "synthesized id must win, got:\n{ts}");
+	}
+
+	#[test]
+	fn object_literal_properties() {
+		let d = doc(vec![table(
+			"user",
+			vec![field(
+				"meta",
+				FieldType::Object {
+					fields: vec![
+						ObjectField {
+							name: "a".into(),
+							r#type: prim(PrimitiveType::String),
+						},
+						ObjectField {
+							name: "my key".into(),
+							r#type: FieldType::Option {
+								inner: Box::new(prim(PrimitiveType::Int)),
+							},
+						},
+					],
+				},
+				false,
+			)],
+		)]);
+		let ts = to_typescript(&d, &TypegenTsConfig::default()).unwrap();
+		assert!(ts.contains(r#"meta: { a: string; "my key"?: number };"#), "got:\n{ts}");
+	}
+
+	#[test]
+	fn string_unions_get_named_types_in_declared_order() {
+		let d = doc(vec![table(
+			"user",
+			vec![
+				field("role", string_union(&["admin", "editor", "viewer"]), false),
+				field("address.kind", string_union(&["home", "work"]), true),
+				field(
+					"addresses",
+					FieldType::Array {
+						inner: Box::new(prim(PrimitiveType::Object)),
+						max: None,
+					},
+					false,
+				),
+				field("addresses.*.label", string_union(&["billing", "shipping"]), false),
+				field("tags.*", string_union(&["a", "b"]), false),
+			],
+		)]);
+		let ts = to_typescript(&d, &emitting(&[EmitType::StringUnions])).unwrap();
+		assert!(ts.contains("role: UserRole;"), "got:\n{ts}");
+		assert!(
+			ts.contains(r#"export type UserRole = "admin" | "editor" | "viewer";"#),
+			"got:\n{ts}"
+		);
+		assert!(ts.contains("kind?: UserAddressKind;"), "got:\n{ts}");
+		assert!(ts.contains("label: UserAddressesLabel;"), "got:\n{ts}");
+		assert!(ts.contains(r#"tags: ("a" | "b")[];"#), "got:\n{ts}");
+		assert!(!ts.contains("UserTags"), "array elements stay inline, got:\n{ts}");
+	}
+
+	#[test]
+	fn same_union_on_two_tables_gets_two_names() {
+		let d = doc(vec![
+			table("comment", vec![field("status", string_union(&["open", "closed"]), false)]),
+			table("post", vec![field("status", string_union(&["open", "closed"]), false)]),
+		]);
+		let ts = to_typescript(&d, &emitting(&[EmitType::StringUnions])).unwrap();
+		assert!(ts.contains(r#"export type CommentStatus = "open" | "closed";"#), "got:\n{ts}");
+		assert!(ts.contains(r#"export type PostStatus = "open" | "closed";"#), "got:\n{ts}");
+		assert!(ts.contains("status: PostStatus;"), "got:\n{ts}");
+	}
+
+	#[test]
+	fn clashing_union_name_stays_inline() {
+		let d = doc(vec![
+			table(
+				"user",
+				vec![
+					field("role_type", string_union(&["a", "b"]), false),
+					field("status", string_union(&["on", "off"]), false),
+				],
+			),
+			table("user_role", vec![field("type", string_union(&["x", "y"]), false)]),
+			table("user_status", vec![]),
+		]);
+		let ts = to_typescript(&d, &emitting(&[EmitType::StringUnions])).unwrap();
+		assert!(ts.contains("role_type: UserRoleType;"), "got:\n{ts}");
+		assert!(ts.contains(r#"type: "x" | "y";"#), "got:\n{ts}");
+		assert!(ts.contains(r#"status: "on" | "off";"#), "got:\n{ts}");
+		assert_eq!(ts.matches("export type UserRoleType").count(), 1, "got:\n{ts}");
+		assert_eq!(ts.matches("UserStatus").count(), 1, "got:\n{ts}");
+	}
+
+	#[test]
+	fn consts_export_union_values() {
+		let d =
+			doc(vec![table("user", vec![field("role", string_union(&["admin", "guest"]), false)])]);
+		let ts = to_typescript(&d, &emitting(&[EmitType::StringUnions, EmitType::Consts])).unwrap();
+		assert!(
+			ts.contains(
+				"export const USER_ROLE_VALUES = [\"admin\", \"guest\"] as const;\n\
+				 export type UserRole = (typeof USER_ROLE_VALUES)[number];\n"
+			),
+			"got:\n{ts}"
+		);
+	}
+
+	#[test]
+	fn table_map_quotes_keys_and_exports_table_names() {
+		let d = doc(vec![table("blog-post", vec![]), table("user", vec![])]);
+		let ts = to_typescript(&d, &emitting(&[EmitType::TableMap])).unwrap();
+		assert!(ts.contains(r#"export type $TableName = "blog-post" | "user";"#), "got:\n{ts}");
+		assert!(
+			ts.contains(
+				"export interface $TableMap extends Record<$TableName, object> {\n  \"blog-post\": BlogPost;\n  user: User;\n}\n"
+			),
+			"got:\n{ts}"
+		);
+	}
+
+	#[test]
+	fn table_defaults_list_fields_with_a_default() {
+		let d = doc(vec![
+			table(
+				"user",
+				vec![
+					with_default(field("role", prim(PrimitiveType::String), false)),
+					field("name", prim(PrimitiveType::String), false),
+					with_default(field("created_at", prim(PrimitiveType::Datetime), false)),
+				],
+			),
+			table("tag", vec![field("name", prim(PrimitiveType::String), false)]),
+		]);
+		let ts = to_typescript(&d, &emitting(&[EmitType::TableDefaults])).unwrap();
+		assert!(
+			ts.contains(
+				"export interface $TableDefault {\n  user: \"role\" | \"created_at\";\n}\n"
+			),
+			"got:\n{ts}"
+		);
+		let ts =
+			to_typescript(&d, &emitting(&[EmitType::TableDefaults, EmitType::Consts])).unwrap();
+		assert!(
+			ts.contains(
+				"export const $TABLE_DEFAULT_VALUES = {\n  user: [\"role\", \"created_at\"],\n} as const;\n"
+			),
+			"got:\n{ts}"
+		);
+	}
+
+	#[test]
+	fn overrides_rename_table_types() {
+		let cfg = TypegenTsConfig {
+			emit: [EmitType::TableMap, EmitType::TableDefaults].into(),
+			overrides: EmitOverrides {
+				table_names: Some("TableName".into()),
+				table_map: Some("Tables".into()),
+				table_defaults: Some("Defaults".into()),
+			},
+		};
+		let ts = to_typescript(&doc(vec![table("user", vec![])]), &cfg).unwrap();
+		assert!(ts.contains(r#"export type TableName = "user";"#), "got:\n{ts}");
+		assert!(
+			ts.contains("export interface Tables extends Record<TableName, object> {"),
+			"got:\n{ts}"
+		);
+		assert!(ts.contains("export interface Defaults {"), "got:\n{ts}");
+	}
+
+	#[test]
+	fn output_is_stable_across_renders() {
+		let d = doc(vec![
+			table("post", vec![field("status", string_union(&["draft", "live", "gone"]), false)]),
+			table("user", vec![field("role", string_union(&["a", "b", "c", "d", "e"]), false)]),
+		]);
+		let cfg = emitting(&[
+			EmitType::StringUnions,
+			EmitType::Consts,
+			EmitType::TableMap,
+			EmitType::TableDefaults,
+		]);
+		let first = to_typescript(&d, &cfg).unwrap();
+		for _ in 0..10 {
+			assert_eq!(to_typescript(&d, &cfg).unwrap(), first);
+		}
 	}
 }

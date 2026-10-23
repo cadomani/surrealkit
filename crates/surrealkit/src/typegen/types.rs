@@ -5,12 +5,7 @@
 //! tagged on `kind`) so the JSON can be consumed by other emitters — e.g. a
 //! future TypeScript generator — without re-introspecting the database.
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-
-use crate::typegen::string_union::{StringUnion, StringUnionMap, is_string_union, pascal_case};
 
 /// Top-level generated schema document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -187,105 +182,4 @@ pub enum PrimitiveType {
 	Object,
 	/// Bare `function`.
 	Function,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CollectFlags {
-	pub collect_defaults: bool,
-	pub collect_unions: bool,
-	pub emit_table_map: bool,
-	pub emit_table_names: bool,
-	pub emit_consts: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct EmitCollection {
-	pub flags: CollectFlags,
-	pub defaults: Option<StringUnionMap>,
-	pub unions: Option<StringUnionMap>,
-	pub replacements: HashMap<String, String>,
-	pub record_types: HashMap<String, String>,
-	pub field_sep: Option<String>,
-}
-
-impl EmitCollection {
-	pub fn new(flags: CollectFlags, field_sep: Option<String>) -> Self {
-		let get_defaults = flags.collect_defaults;
-		let get_unions = flags.collect_unions;
-
-		Self {
-			flags,
-			field_sep,
-			defaults: if get_defaults {
-				Some(StringUnionMap::new(true))
-			} else {
-				None
-			},
-			unions: if get_unions {
-				Some(StringUnionMap::new(true))
-			} else {
-				None
-			},
-			record_types: HashMap::new(),
-			replacements: HashMap::new(),
-		}
-	}
-
-	pub fn add_default(&mut self, table_name: &str, field: &FieldDef) {
-		if self.flags.collect_defaults && field.has_default {
-			let defaults = self.defaults.get_or_insert_with(|| StringUnionMap::new(true));
-			defaults.add_to_union(table_name, &field.name, None);
-		}
-	}
-
-	pub fn add_str_union(&mut self, table_name: &str, field: &FieldDef) {
-		if self.flags.collect_unions
-			&& let Some(union) = field_type_to_union(table_name, &field.name, &field.r#type)
-		{
-			let field_path: String = self.aggregate_path(table_name, &field.name);
-			self.replacements.insert(
-				field_path,
-				self.unions.get_or_insert_with(|| StringUnionMap::new(true)).add_union(&union),
-			);
-		};
-	}
-
-	pub fn add_record_type(&mut self, table: String, type_str: String) {
-		self.record_types.insert(table, type_str);
-	}
-
-	pub fn aggregate_path(&self, cur: &str, new_element: &str) -> String {
-		format!("{}{}{}", cur, self.field_sep.clone().unwrap_or(".".to_string()), new_element)
-	}
-}
-
-fn is_array_type(name: &str) -> bool {
-	name.ends_with(".*")
-}
-
-fn field_type_to_union(table_name: &str, field_name: &str, ty: &FieldType) -> Option<StringUnion> {
-	if is_array_type(field_name) || !is_string_union(ty) {
-		return None;
-	}
-
-	match ty {
-		FieldType::Union {
-			variants,
-		} => {
-			let mut union = StringUnion::new(
-				&format!("{}{}", pascal_case(table_name), pascal_case(field_name)),
-				true,
-			);
-			variants.iter().for_each(|f| {
-				if let FieldType::Literal {
-					value: Value::String(s),
-				} = f
-				{
-					union.add(s)
-				}
-			});
-			Some(union)
-		}
-		_ => None,
-	}
 }
